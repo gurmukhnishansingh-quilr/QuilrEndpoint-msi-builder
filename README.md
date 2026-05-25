@@ -124,23 +124,103 @@ at the end and exits non-zero if any env failed.
 
 ## 5. Install (silent / scripted)
 
+The single MSI is environment-agnostic. By default the launcher looks the
+`TENANTID` up in the discovery service (`https://discover.quilrai.dev/discovery/<TENANTID>`)
+and resolves the environment from the returned backend URL — e.g. tenant
+`442e052d-4c60-4cdc-961e-bc9db74a40ca` resolves to backend `https://preprod.quilr.ai`,
+i.e. env **`preprod`**.
+
 ```powershell
-msiexec /i sentinel-endpoint-preprod-0.30.291.msi /qn `
-        /l*v %TEMP%\sentinel-msi.log `
-        TENANTID=<your-tenant-id> `
-        EMAIL=user@org.com
+# Normal: env resolved automatically from the Tenant ID via discovery
+msiexec /i quilrai-endpoint-agent.msi /qn `
+        /l*v %TEMP%\quilrai-msi.log `
+        TENANTID=442e052d-4c60-4cdc-961e-bc9db74a40ca
 ```
+
+### Pinning the environment with `ENVNAME` (air-gapped / skip discovery)
+
+Pass `ENVNAME` to skip the discovery call and pin the environment explicitly —
+useful for air-gapped installs or to override what discovery would return. Use
+the **same short env name** discovery resolves to (the value derived from the
+backend URL, *not* the URL itself):
+
+```powershell
+# Pin to the env discovery shows for this tenant (preprod) -- no network needed
+msiexec /i quilrai-endpoint-agent.msi /qn `
+        TENANTID=442e052d-4c60-4cdc-961e-bc9db74a40ca `
+        ENVNAME=preprod
+```
+
+Valid `ENVNAME` values (see §1 for the backend each maps to):
+`quartz` · `preprod` · `usprod` · `uspoc` · `india-prod` · `india-poc` · `secure` · `qualtrix-secure`
+
+| discovery `QUILR_BACKEND_BASE_URL` | `ENVNAME` |
+|------------------------------------|-----------|
+| `https://quartz.quilr.ai`          | `quartz`     |
+| `https://preprod.quilr.ai`         | `preprod`    |
+| `https://app.quilrai.com`          | `usprod`     |
+| `https://app.quilr.ai`             | `uspoc`      |
+| `https://platform.quilrai.com`     | `india-prod` |
+| `https://platform.quilr.ai`        | `india-poc`  |
+| `https://secure.quilr.ai`          | `secure`     |
 
 ### MSI properties
 
-| Property   | Required for silent install      | Effect                                                  |
-|------------|----------------------------------|----------------------------------------------------------|
-| `TENANTID` | **Yes** (unless pre-staged)      | Forwarded as `-TenantId` to `sentinel-endpoint.ps1`     |
-| `EMAIL`    | No                               | Forwarded as `-Email`                                    |
-| `ENVNAME`  | No (baked into MSI)              | Override the env baked at build time. Persisted to `HKLM\SOFTWARE\Quilr\Sentinel\Env`. |
+| Property   | Required for silent install | Effect                                                                 |
+|------------|-----------------------------|------------------------------------------------------------------------|
+| `TENANTID` | **Yes** (unless pre-staged) | Validated against discovery; binds the device and resolves the env     |
+| `ENVNAME`  | No                          | Pin the env, skip discovery (see above)                                |
+| `APIKEY`   | No                          | `x-api-key` for the discovery call (overrides the baked default)       |
+| `DLPURL`        | No                     | Override `QUILR_DLP_ENDPOINT`        (else discovery → env switch)      |
+| `BACKENDURL`    | No                     | Override `QUILR_BACKEND_BASE_URL`                                       |
+| `TEMPLATEDIR`   | No                     | Override `QUILRAI_TEMPLATE_DIR`                                         |
+| `INSTALLPATH`   | No                     | Override `QUILRAI_INSTALLATION_PATH`                                    |
+| `WORKEMAIL`     | No                     | Override `QUILRAI_OVERRIDE_EMAIL`                                       |
+| `UNIFIEDDLP`    | No                     | Override `QUILRAI_UNIFIED_DLP_POLICY`                                   |
+| `RUSTLOG`       | No                     | Override `RUST_LOG`                                                     |
+
+Precedence for the agent config vars: **explicit property > discovery > env switch**.
+
+### Environment variables (from discovery)
+
+The agent's runtime config comes from the discovery service's `endpoint_agent_env`.
+For example, `GET https://discover.quilrai.dev/discovery/442e052d-4c60-4cdc-961e-bc9db74a40ca`
+(with header `x-api-key: <key>`) returns:
+
+```json
+{
+  "tenant_id": "442e052d-4c60-4cdc-961e-bc9db74a40ca",
+  "endpoint_agent_env": {
+    "QUILR_DLP_ENDPOINT": "https://dlpone.quilr.ai",
+    "QUILR_BACKEND_BASE_URL": "https://preprod.quilr.ai",
+    "QUILRAI_INSTALLATION_PATH": "C:\\Program Files\\QuilrAI",
+    "QUILRAI_TEMPLATE_DIR": "C:\\Program Files\\QuilrAI\\templates\\app-discovery"
+  }
+}
+```
+
+`install-launcher.exe` applies these **verbatim** (discovery is authoritative) to both:
+
+- **System environment variables** — `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment` (visible to every session)
+- the **`QuilrAIAgent` service** environment block — `HKLM\SYSTEM\CurrentControlSet\Services\QuilrAIAgent\Environment` (REG_MULTI_SZ), which additionally gets `RUST_LOG=info` and `QUILR_TENANT_ID=<id>`
+
+It also sets `NODE_EXTRA_CA_CERTS=C:\Program Files\QuilrAI\cert.pem` and `NODE_TLS_REJECT_UNAUTHORIZED=0`.
+
+So after installing the tenant above, the machine ends up with:
+
+```text
+QUILR_DLP_ENDPOINT        = https://dlpone.quilr.ai
+QUILR_BACKEND_BASE_URL    = https://preprod.quilr.ai
+QUILRAI_INSTALLATION_PATH = C:\Program Files\QuilrAI
+QUILRAI_TEMPLATE_DIR      = C:\Program Files\QuilrAI\templates\app-discovery
+NODE_EXTRA_CA_CERTS       = C:\Program Files\QuilrAI\cert.pem
+NODE_TLS_REJECT_UNAUTHORIZED = 0
+```
+
+Any key you also pass as an MSI property (e.g. `DLPURL=https://custom-dlp`) overrides the discovery value for that variable.
 
 ### Alternative ways to supply `TENANTID`
-For MDM/GPO flows where tenant ID is delivered out-of-band:
+For MDM/GPO flows where the tenant ID is delivered out-of-band:
 
 1. Machine env var **before** msiexec runs:
    ```powershell
@@ -148,8 +228,8 @@ For MDM/GPO flows where tenant ID is delivered out-of-band:
    ```
 2. Pre-staged tenant file:
    ```powershell
-   New-Item -ItemType Directory C:\ProgramData\Sentinel -Force | Out-Null
-   Set-Content -Path C:\ProgramData\Sentinel\tenant_id -Value '<id>' -NoNewline -Encoding ASCII
+   New-Item -ItemType Directory C:\ProgramData\QuilrAI -Force | Out-Null
+   Set-Content -Path C:\ProgramData\QuilrAI\tenant_id -Value '<id>' -NoNewline -Encoding ASCII
    ```
 
 ---
