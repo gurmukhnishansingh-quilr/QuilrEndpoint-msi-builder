@@ -34,6 +34,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Net;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.ServiceProcess;
 using System.Text;
@@ -355,8 +356,7 @@ internal static class InstallLauncher {
         int n = 0;
         foreach (var kv in vars) {
             if (string.IsNullOrEmpty(kv.Key)) continue;
-            try { Environment.SetEnvironmentVariable(kv.Key, kv.Value, EnvironmentVariableTarget.Machine); n++; }
-            catch (Exception ex) { Log("WARN: set " + kv.Key + " (Machine) failed: " + ex.Message); }
+            SetMachineEnv(kv.Key, kv.Value); n++;   // registry-direct (no per-call broadcast)
         }
         Log("Applied " + n + " " + label + " var(s) at Machine scope from discovery.");
     }
@@ -583,6 +583,9 @@ internal static class InstallLauncher {
         // These are only set when supplied (override) -- otherwise clear any stale value.
         if (!cfg.ContainsKey("QUILRAI_OVERRIDE_EMAIL"))    SetMachineEnv("QUILRAI_OVERRIDE_EMAIL", null);
         if (!cfg.ContainsKey("QUILRAI_UNIFIED_DLP_POLICY")) SetMachineEnv("QUILRAI_UNIFIED_DLP_POLICY", null);
+        // SetNodeCaEnv + the loop above wrote the registry directly (fast, no per-call
+        // broadcast). Notify the system ONCE so new processes see the new env.
+        BroadcastEnvChange();
 
         ConfigureServiceRuntime(tenantId, cfg);
         StartAgentService();
@@ -691,9 +694,36 @@ internal static class InstallLauncher {
         }
     }
 
+    // Write (or, when value is null/empty, delete) a Machine-scope env var DIRECTLY
+    // in the registry. We deliberately avoid Environment.SetEnvironmentVariable(Machine)
+    // here: it broadcasts WM_SETTINGCHANGE on every call (each blocks up to ~1s per
+    // unresponsive top-level window), which made setting ~8 vars take ~20s. Instead we
+    // write the registry instantly and broadcast ONCE via BroadcastEnvChange() after
+    // all vars are set (see ConfigureAndStartAgent).
+    private const string MachineEnvKey = @"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
     private static void SetMachineEnv(string name, string value) {
-        try { Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.Machine); }
-        catch (Exception ex) { Log("WARN: set " + name + " (Machine) failed: " + ex.Message); }
+        try {
+            using (var k = Win32Registry.LocalMachine.OpenSubKey(MachineEnvKey, true)) {
+                if (k == null) { Log("WARN: cannot open machine Environment key."); return; }
+                if (string.IsNullOrEmpty(value)) {
+                    if (k.GetValue(name) != null) k.DeleteValue(name, false);
+                } else {
+                    k.SetValue(name, value, Win32RegistryValueKind.String);
+                }
+            }
+        } catch (Exception ex) { Log("WARN: set " + name + " (Machine) failed: " + ex.Message); }
+    }
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam,
+        string lParam, uint flags, uint timeoutMs, out IntPtr result);
+    private static void BroadcastEnvChange() {
+        // One HWND_BROADCAST of WM_SETTINGCHANGE("Environment") so new processes pick
+        // up the machine env without a logoff. SMTO_ABORTIFHUNG + 1s keeps it bounded.
+        try {
+            IntPtr res;
+            SendMessageTimeout((IntPtr)0xFFFF, 0x001A, IntPtr.Zero, "Environment", 0x0002, 1000, out res);
+        } catch { }
     }
 
     // Configure the MSI-created QuilrAIAgent service: failure-recovery policy and

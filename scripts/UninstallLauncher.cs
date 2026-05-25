@@ -68,6 +68,13 @@ internal static class UninstallLauncher {
     private static extern bool MoveFileEx(string existing, string newName, int flags);
     private const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
 
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam,
+        string lParam, uint flags, uint timeoutMs, out IntPtr result);
+    private const int HWND_BROADCAST = 0xFFFF;
+    private const uint WM_SETTINGCHANGE = 0x001A;
+    private const uint SMTO_ABORTIFHUNG = 0x0002;
+
     private static int Main(string[] args) {
         try {
             string temp = Environment.GetEnvironmentVariable("TEMP")
@@ -249,15 +256,36 @@ internal static class UninstallLauncher {
     }
 
     // ── 5a. Environment variables ─────────────────────────────────────────────
+    // Delete the values DIRECTLY from the registry, then broadcast WM_SETTINGCHANGE
+    // ONCE. We do NOT use Environment.SetEnvironmentVariable(...,Machine/User): that
+    // broadcasts on every call, and each broadcast blocks up to ~1s per unresponsive
+    // top-level window -- with ~26 calls under appwiz.cpl that added ~60s to the
+    // uninstall. Registry deletes are instant.
+    private const string MachineEnvKey = @"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
     private static void RemoveEnvVars() {
-        foreach (string v in EnvVars) {
-            try { Environment.SetEnvironmentVariable(v, null, EnvironmentVariableTarget.Machine); } catch { }
-            try { Environment.SetEnvironmentVariable(v, null, EnvironmentVariableTarget.User); } catch { }
+        int n = 0;
+        using (var m = Registry.LocalMachine.OpenSubKey(MachineEnvKey, true))
+        using (var u = Registry.CurrentUser.OpenSubKey("Environment", true)) {
+            foreach (string v in EnvVars) {
+                try { if (m != null && m.GetValue(v) != null) { m.DeleteValue(v, false); n++; } }
+                catch (Exception ex) { Log("  WARN: del Machine " + v + ": " + ex.Message); }
+                try { if (u != null && u.GetValue(v) != null) { u.DeleteValue(v, false); n++; } }
+                catch (Exception ex) { Log("  WARN: del User " + v + ": " + ex.Message); }
+            }
         }
-        Log("  cleared " + EnvVars.Length + " env var(s) at Machine+User scope.");
+        BroadcastEnvChange();
+        Log("  removed " + n + " env var value(s) from registry (Machine+User), broadcast once.");
         // The Env marker the install launcher wrote (single-package model).
         try { Win32RegistryDelete(@"SOFTWARE\Quilr\Sentinel"); Log("  removed HKLM\\SOFTWARE\\Quilr\\Sentinel"); }
         catch (Exception ex) { Log("  WARN: remove HKLM\\SOFTWARE\\Quilr\\Sentinel: " + ex.Message); }
+    }
+
+    private static void BroadcastEnvChange() {
+        try {
+            IntPtr res;
+            SendMessageTimeout((IntPtr)HWND_BROADCAST, WM_SETTINGCHANGE, IntPtr.Zero,
+                "Environment", SMTO_ABORTIFHUNG, 1000, out res);
+        } catch { /* best-effort: a logoff/reboot picks up the change regardless */ }
     }
 
     // ── 5b. QUIC browser policies ─────────────────────────────────────────────
