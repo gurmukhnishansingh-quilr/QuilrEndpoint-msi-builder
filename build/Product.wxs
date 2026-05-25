@@ -1,0 +1,379 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sentinel Endpoint MSI Installer  (supports BOTH packaging modes)
+  ================================================================
+  SINGLE mode (default): one env-agnostic MSI. The launcher asks the discovery
+    service (https://discover.quilrai.dev) which env the TENANTID belongs to and
+    writes HKLM\SOFTWARE\Quilr\Sentinel\Env before the agent runs.
+  PER-ENV mode: env baked at build time. Selected by passing -dDefaultEnv=<env>;
+    ENVNAME defaults to that env and the launcher writes it directly (no
+    discovery lookup needed).
+
+  In both modes the launcher writes the Env marker before the agent runs, so
+  the install-exec sequencing is identical.
+
+  Build-time inputs (candle.exe -dKEY=VALUE):
+    ProductVersion  e.g. "0.30.293"     Product version (X.X.X[.X])
+    PayloadDir      absolute path       Folder with PS1s, launchers, deps, icon
+    AgentDir        absolute path       Extracted agent package (heat -var var.AgentDir)
+    ProductName     ARP display name
+    UpgradeCode     GUID (single: one stable code; per-env: stable per env)
+    DefaultEnv      OPTIONAL. Present => PER-ENV mode (bakes ENVNAME default).
+                    Absent => SINGLE mode (env resolved from discovery).
+
+  MSI properties (msiexec /i .. PROP=value):
+    TENANTID    Required for silent installs. Forwarded as -TenantId; used for
+                the discovery lookup. Also via QUILR_TENANT_ID env or
+                pre-staged C:\ProgramData\Sentinel\tenant_id.
+    ENVNAME     Env override. Defaulted in per-env MSIs; in the single MSI it's
+                empty and only set to skip discovery (air-gap). One of:
+                quartz|preprod|usprod|uspoc|india-prod|india-poc|secure|qualtrix-secure
+    APIKEY      OPTIONAL. x-api-key for the discovery call. If omitted, the
+                launcher uses QUILR_DISCOVERY_API_KEY (machine env) or its baked
+                default. Pass APIKEY=<key> to override (e.g. after key rotation).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <Product Id="*"
+           Name="$(var.ProductName)"
+           Language="1033"
+           Version="$(var.ProductVersion)"
+           Manufacturer="Quilr, Inc."
+           UpgradeCode="$(var.UpgradeCode)">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Manufacturer="Quilr, Inc."
+             Description="QuilrAI Endpoint Agent (offline installer)"
+             Comments="Wraps the QuilrAI installer; bundles the extracted agent payload."
+             Platform="x64" />
+
+    <!-- Single embedded cab keeps distribution to one .msi file. -->
+    <Media Id="1" Cabinet="payload.cab" EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Major upgrade: uninstall older versions cleanly when a newer MSI runs. -->
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of QuilrAI Endpoint Agent is already installed."
+        Schedule="afterInstallInitialize" />
+
+    <!-- Properties surfaced to msiexec / Group Policy / Intune.
+         Secure="yes" lets them flow into UI-restricted (silent) installs. -->
+    <Property Id="TENANTID"  Secure="yes" />
+    <!-- Optional discovery API key override. Empty by default; the launcher
+         falls back to QUILR_DISCOVERY_API_KEY or its baked default. Only set
+         when explicitly overriding (e.g. key rotation); otherwise the baked
+         default stays inside the launcher exe and never hits the command line. -->
+    <Property Id="APIKEY"    Secure="yes" />
+    <!-- PER-ENV mode bakes the env as the ENVNAME default; SINGLE mode leaves
+         it empty so the launcher resolves it from discovery. (WiX rejects an
+         empty Value="" attribute, so the two cases are separate elements.) -->
+    <?ifdef DefaultEnv ?>
+    <Property Id="ENVNAME"   Secure="yes" Value="$(var.DefaultEnv)" />
+    <?else?>
+    <Property Id="ENVNAME"   Secure="yes" />
+    <?endif?>
+
+    <!-- OPTIONAL agent-config overrides. Empty by default. When set on the
+         msiexec command line (or via GPO/Intune) they take HIGHEST precedence:
+         explicit property > discovery (endpoint_agent_env) > env->URL switch.
+         They're forwarded to install-launcher.exe and applied to BOTH the
+         machine env and the service Environment block. Property -> env var:
+           DLPURL      -> QUILR_DLP_ENDPOINT
+           BACKENDURL  -> QUILR_BACKEND_BASE_URL
+           TEMPLATEDIR -> QUILRAI_TEMPLATE_DIR
+           INSTALLPATH -> QUILRAI_INSTALLATION_PATH
+           WORKEMAIL   -> QUILRAI_OVERRIDE_EMAIL
+           UNIFIEDDLP  -> QUILRAI_UNIFIED_DLP_POLICY
+           RUSTLOG     -> RUST_LOG
+         Example:
+           msiexec /i quilrai-endpoint-agent.msi /qn TENANTID=<id> ^
+                   DLPURL=https://custom-dlp INSTALLPATH="C:\Program Files\QuilrAI"
+         (Concise names keep the deferred-CA command line under the MSI
+         CustomAction.Target length limit, avoiding ICE03.) -->
+    <Property Id="DLPURL"      Secure="yes" />
+    <Property Id="BACKENDURL"  Secure="yes" />
+    <Property Id="TEMPLATEDIR" Secure="yes" />
+    <Property Id="INSTALLPATH" Secure="yes" />
+    <Property Id="WORKEMAIL"   Secure="yes" />
+    <Property Id="UNIFIEDDLP"  Secure="yes" />
+    <Property Id="RUSTLOG"     Secure="yes" />
+
+    <!-- perMachine is already declared on <Package InstallScope=...>, which
+         emits ALLUSERS=1 and MSIINSTALLPERUSER=0 implicitly. -->
+
+    <!-- Hide modify+repair entries (Programs & Features doesn't expose them). -->
+    <Property Id="ARPNOMODIFY"      Value="1" />
+    <Property Id="ARPNOREPAIR"      Value="1" />
+    <Property Id="ARPHELPLINK"      Value="https://quilr.ai/support" />
+    <Property Id="ARPURLINFOABOUT"  Value="https://quilr.ai" />
+
+    <!-- Quilr branding in Programs & Features (appwiz.cpl). The Icon table
+         entry is what ARPPRODUCTICON references; the Binary table entry is
+         what UI controls reference. Both point at the same source .ico. -->
+    <Icon   Id="QuilrIcon.ico"   SourceFile="$(var.PayloadDir)\quilr.ico" />
+    <Binary Id="QuilrLogoBinary" SourceFile="$(var.PayloadDir)\quilr.ico" />
+    <Property Id="ARPPRODUCTICON" Value="QuilrIcon.ico" />
+
+    <!-- Always emit an MSI log without requiring /l*v. The log lands at
+         %TEMP%\MSI<random>.log (Windows Installer-managed name). Characters
+         enable verbose + status + custom-action output. -->
+    <Property Id="MsiLogging" Value="voicewarmupx" />
+
+    <!-- Block install when not elevated. -->
+    <Condition Message="Administrator privileges are required to install QuilrAI Endpoint Agent.">
+      Privileged
+    </Condition>
+
+    <!-- Directory tree.
+         QUILRAIDIR  (C:\Program Files\QuilrAI)        -> the agent itself. MSI
+            installs every agent file here and removes them on uninstall; the
+            QuilrAIAgent service is created/removed via the ServiceInstall /
+            ServiceControl on the quilrai.exe component below.
+         INSTALLERDIR (C:\Program Files\Quilr\Sentinel-Installer) -> MSI helper
+            files used by the custom actions (launcher exes, cert bundle, vc_redist). -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+
+        <Directory Id="QUILRAIDIR" Name="QuilrAI">
+          <!-- quilrai.exe is authored by hand (excluded from the heat harvest by
+               exclude-quilrai-exe.xslt) so it can carry the service definition.
+               ServiceInstall creates QuilrAIAgent on install; ServiceControl
+               stops it and removes it on uninstall. MSI does NOT start the
+               service: install-launcher.exe writes the discovery-resolved env
+               block first, then starts it. -->
+          <Component Id="cmp_QuilrAiExe" Guid="A1B2C3D4-9999-4999-8999-999999999999" Win64="yes">
+            <File Id="fil_QuilrAiExe"
+                  Source="$(var.AgentDir)\quilrai.exe"
+                  Name="quilrai.exe"
+                  KeyPath="yes" />
+            <ServiceInstall Id="QuilrAIAgentServiceInstall"
+                            Name="QuilrAIAgent"
+                            DisplayName="QuilrAI Endpoint Agent"
+                            Description="QuilrAI Endpoint Agent - endpoint security and DLP enforcement."
+                            Type="ownProcess"
+                            Start="auto"
+                            ErrorControl="normal"
+                            Arguments="--service"
+                            Account="LocalSystem"
+                            Interactive="no"
+                            Vital="no" />
+            <ServiceControl Id="QuilrAIAgentServiceControl"
+                            Name="QuilrAIAgent"
+                            Stop="both"
+                            Remove="uninstall"
+                            Wait="yes" />
+          </Component>
+        </Directory>
+
+        <Directory Id="QuilrDir" Name="Quilr">
+          <Directory Id="INSTALLERDIR" Name="Sentinel-Installer">
+
+            <!-- Both install and uninstall are performed natively by the C#
+                 launcher exes; the MSI ships no PowerShell scripts. -->
+            <Component Id="cmp_InstallLauncherExe" Guid="A1B2C3D4-3333-4333-8333-333333333333" Win64="yes">
+              <File Id="fil_InstallLauncherExe"
+                    Source="$(var.PayloadDir)\install-launcher.exe"
+                    Name="install-launcher.exe"
+                    KeyPath="yes" />
+            </Component>
+
+            <Component Id="cmp_UninstallLauncherExe" Guid="A1B2C3D4-4444-4444-8444-444444444444" Win64="yes">
+              <File Id="fil_UninstallLauncherExe"
+                    Source="$(var.PayloadDir)\uninstall-launcher.exe"
+                    Name="uninstall-launcher.exe"
+                    KeyPath="yes" />
+            </Component>
+
+            <!-- Shared CA cert bundle (issuing/intermediate chain). The
+                 install launcher extracts this and silently adds missing certs
+                 to LocalMachine\Root (self-signed) or LocalMachine\CA
+                 (intermediates). Idempotent by thumbprint. -->
+            <Component Id="cmp_CertsBundleZip" Guid="A1B2C3D4-6666-4666-8666-666666666666" Win64="yes">
+              <File Id="fil_CertsBundleZip"
+                    Source="$(var.PayloadDir)\certs-bundle.zip"
+                    Name="certs-bundle.zip"
+                    KeyPath="yes" />
+            </Component>
+
+            <!-- VC++ 2015-2022 x64 redistributable. The launcher runs this
+                 (quiet) before starting the agent if the runtime is missing. -->
+            <Component Id="cmp_VcRedistExe" Guid="A1B2C3D4-8888-4888-8888-888888888888" Win64="yes">
+              <File Id="fil_VcRedistExe"
+                    Source="$(var.PayloadDir)\vc_redist.x64.exe"
+                    Name="vc_redist.x64.exe"
+                    KeyPath="yes" />
+            </Component>
+
+          </Directory>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature"
+             Title="QuilrAI Endpoint Agent"
+             Level="1"
+             AllowAdvertise="no"
+             Absent="disallow"
+             Display="expand">
+      <ComponentRef Id="cmp_QuilrAiExe" />
+      <ComponentRef Id="cmp_InstallLauncherExe" />
+      <ComponentRef Id="cmp_UninstallLauncherExe" />
+      <ComponentRef Id="cmp_CertsBundleZip" />
+      <ComponentRef Id="cmp_VcRedistExe" />
+      <!-- Remaining agent files (harvested by heat into AgentFiles-*.wxs, minus quilrai.exe). -->
+      <ComponentGroupRef Id="AgentFiles" />
+    </Feature>
+
+    <!-- ============================================================
+         Custom Actions
+         ============================================================
+         Native C# launcher EXEs perform the runtime-specific work that MSI
+         can't express declaratively: discovery-resolved env block, cert/hook/
+         VC++ setup, service start (install), and WinDivert/cert/env teardown
+         (uninstall). MSI's Format function substitutes [TENANTID]/[ENVNAME]/
+         [APIKEY] at schedule time. The launcher EXE finds its own dir via
+         Assembly.GetEntryAssembly().Location and the agent at C:\Program Files\QuilrAI.
+    -->
+
+    <CustomAction Id="RunInstallerExec"
+                  FileKey="fil_InstallLauncherExe"
+                  ExeCommand="--tenant-id &quot;[TENANTID]&quot; --env-name &quot;[ENVNAME]&quot; --api-key &quot;[APIKEY]&quot; --dlp &quot;[DLPURL]&quot; --be &quot;[BACKENDURL]&quot; --tdir &quot;[TEMPLATEDIR]&quot; --ipath &quot;[INSTALLPATH]&quot; --email &quot;[WORKEMAIL]&quot; --udlp &quot;[UNIFIEDDLP]&quot; --rlog &quot;[RUSTLOG]&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <CustomAction Id="RunUninstallerExec"
+                  FileKey="fil_UninstallLauncherExe"
+                  ExeCommand=""
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!-- ============================================================
+         Sequencing
+         ============================================================ -->
+    <InstallExecuteSequence>
+
+      <!-- INSTALL / UPGRADE path: run AFTER InstallServices so the QuilrAIAgent
+           service (created from the ServiceInstall table) already exists. The
+           launcher then resolves the env from discovery, writes the service
+           Environment block + tenant binding, sets up certs/hooks/VC++, and
+           starts the service. REMOVE="ALL" filters this out on uninstall. -->
+      <Custom Action="RunInstallerExec" After="InstallServices">
+        NOT REMOVE
+      </Custom>
+
+      <!-- UNINSTALL path: run BEFORE RemoveFiles. MSI has already stopped +
+           deleted the service (StopServices/DeleteServices precede this), so
+           the launcher kills any lingering processes, UNLOADS WinDivert (so its
+           .sys unlocks for RemoveFiles), and clears certs/env/hooks/policies. -->
+      <Custom Action="RunUninstallerExec" Before="RemoveFiles">
+        REMOVE="ALL"
+      </Custom>
+
+    </InstallExecuteSequence>
+
+    <!-- ============================================================
+         UI: custom single-dialog flow that collects TENANTID and EMAIL
+         from the operator before kicking off the install. /qn skips
+         the UI entirely (values come from the msiexec command line).
+         ============================================================ -->
+
+    <UI Id="WixUI_QuilrInstall">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title"  FaceName="Tahoma" Size="9" Bold="yes" />
+
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="WixUI_Mode"    Value="QuilrInstall" />
+
+      <!-- Reuse the stock infrastructure dialogs (progress, errors, exit). -->
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
+
+      <!-- The custom dialog itself. -->
+      <Dialog Id="TenantIdDlg" Width="370" Height="270"
+              Title="QuilrAI Endpoint Agent Setup" NoMinimize="yes">
+
+        <!-- Header band: WiX default banner BMP underneath, Quilr logo .ico
+             overlaid on the right so the brand is visible on the install UI.
+             Both icon sizes (32 and 16) are present in logo.ico; we request 32. -->
+        <Control Id="BannerBitmap" Type="Bitmap" X="0"   Y="0" Width="370" Height="44"
+                 TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="QuilrLogo"    Type="Icon"   X="328" Y="6" Width="32"  Height="32"
+                 TabSkip="no" FixedSize="yes" IconSize="32" Text="QuilrLogoBinary" />
+        <Control Id="BannerLine"   Type="Line"   X="0"   Y="44" Width="370" Height="0" />
+        <Control Id="Title"        Type="Text"   X="15"  Y="6"  Width="280" Height="15"
+                 Transparent="yes" NoPrefix="yes">
+          <Text>{\WixUI_Font_Title}Account information</Text>
+        </Control>
+        <Control Id="Description"  Type="Text"   X="25"  Y="23" Width="280" Height="15"
+                 Transparent="yes" NoPrefix="yes">
+          <Text>Enter your Quilr Tenant ID to bind this device to your organisation.</Text>
+        </Control>
+
+        <!-- Tenant ID -->
+        <Control Id="TenantLabel" Type="Text"  X="20" Y="70"  Width="120" Height="12"
+                 Transparent="yes" NoPrefix="yes">
+          <Text>Tenant ID  (required):</Text>
+        </Control>
+        <Control Id="TenantEdit"  Type="Edit"  X="20" Y="85"  Width="325" Height="18"
+                 Property="TENANTID" />
+
+        <!-- Helper text -->
+        <Control Id="Hint" Type="Text" X="20" Y="120" Width="325" Height="60"
+                 Transparent="yes" NoPrefix="yes">
+          <Text>Your Tenant ID is provided by your IT administrator or in the Quilr admin console. It is required; without it, the agent cannot authenticate this device to your organisation.</Text>
+        </Control>
+
+        <!-- Footer band -->
+        <Control Id="BottomLine" Type="Line"       X="0"   Y="234" Width="370" Height="0" />
+        <Control Id="Install"    Type="PushButton" X="236" Y="243" Width="56"  Height="17"
+                 Default="yes" Text="&amp;Install">
+          <!-- Empty TENANTID -> popup error; otherwise close UI and run install. -->
+          <Publish Event="SpawnDialog" Value="InvalidTenantIdDlg"><![CDATA[TENANTID = ""]]></Publish>
+          <Publish Event="EndDialog"   Value="Return"><![CDATA[TENANTID <> ""]]></Publish>
+        </Control>
+        <Control Id="Cancel"     Type="PushButton" X="304" Y="243" Width="56"  Height="17"
+                 Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+      </Dialog>
+
+      <!-- Modal popup shown when the user clicks Install with an empty Tenant ID. -->
+      <Dialog Id="InvalidTenantIdDlg" Width="260" Height="85"
+              Title="QuilrAI Endpoint Agent" NoMinimize="yes">
+        <Control Id="Icon" Type="Icon" X="15" Y="15" Width="24" Height="24"
+                 ToolTip="Error" FixedSize="yes" IconSize="32" Text="WixUI_Ico_Exclam" />
+        <Control Id="Text" Type="Text" X="48" Y="15" Width="194" Height="40"
+                 Transparent="yes" NoPrefix="yes">
+          <Text>Tenant ID is required. Please enter the Tenant ID provided by your administrator before continuing.</Text>
+        </Control>
+        <Control Id="Return" Type="PushButton" X="102" Y="60" Width="56" Height="17"
+                 Default="yes" Cancel="yes" Text="OK">
+          <Publish Event="EndDialog" Value="Return">1</Publish>
+        </Control>
+      </Dialog>
+
+      <!-- Open TenantIdDlg on fresh installs only. Repair/uninstall paths
+           skip it (no input needed). -->
+      <InstallUISequence>
+        <Show Dialog="TenantIdDlg" Before="ProgressDlg">NOT Installed</Show>
+      </InstallUISequence>
+    </UI>
+
+    <!-- Brings in shared dialogs (ProgressDlg, CancelDlg, ErrorDlg, etc.)
+         and the WixUI_Bmp_* / WixUI_Ico_* artwork referenced above. -->
+    <UIRef Id="WixUI_Common" />
+
+  </Product>
+</Wix>

@@ -1,0 +1,25 @@
+# ── Build outputs ────────────────────────────────────────────────────────
+/out/
+
+# ── Cached/large dependencies (re-supplied at build time) ────────────────
+#   payload\_shared holds certs-bundle.zip + vc_redist.x64.exe (operator-placed)
+/payload/
+
+# ── WiX intermediates + heat-generated source + staged payloads ──────────
+/build/launchers/
+/build/staged-payload*/
+/build/*.wixobj
+/build/*.wixpdb
+/build/AgentFiles-*.wxs
+#   NOTE: build/Product.wxs and build/exclude-quilrai-exe.xslt ARE tracked.
+
+# ── Bundled agent package (downloaded from the signed release, not source) ─
+/source/*.zip
+
+# ── Local Claude Code settings ───────────────────────────────────────────
+/.claude/
+
+# ── Misc ─────────────────────────────────────────────────────────────────
+*.user
+*.suo
+Thumbs.db
