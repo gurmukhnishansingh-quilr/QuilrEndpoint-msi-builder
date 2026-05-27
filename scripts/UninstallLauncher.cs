@@ -304,17 +304,31 @@ internal static class UninstallLauncher {
 
     // ── 5c. Re-enable IPv6 (drop our DisabledComponents=0xFF override) ─────────
     private static void EnableIPv6() {
+        // 1. Remove the persistent global override the installer set.
         const string key = @"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters";
         try {
             using (var k = Registry.LocalMachine.OpenSubKey(key, true)) {
-                if (k == null) return;
-                object v = k.GetValue("DisabledComponents");
-                if (v == null) return;
-                int cur = Convert.ToInt32(v);
-                if (cur == 0xFF) { k.DeleteValue("DisabledComponents", false); Log("  removed Tcpip6 DisabledComponents=0xFF (IPv6 re-enabled across reboots)."); }
-                else Log("  Tcpip6 DisabledComponents=0x" + cur.ToString("X") + " is not our override -- left untouched.");
+                if (k != null) {
+                    object v = k.GetValue("DisabledComponents");
+                    if (v != null) {
+                        int cur = Convert.ToInt32(v);
+                        if (cur == 0xFF) { k.DeleteValue("DisabledComponents", false); Log("  removed Tcpip6 DisabledComponents=0xFF (IPv6 re-enabled across reboots)."); }
+                        else Log("  Tcpip6 DisabledComponents=0x" + cur.ToString("X") + " is not our override -- left untouched.");
+                    }
+                }
             }
         } catch (Exception ex) { Log("  WARN: IPv6 registry cleanup: " + ex.Message); }
+        // 2. Re-enable the per-adapter ms_tcpip6 binding the installer disabled (immediate).
+        try {
+            string psh = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
+            var psi = new ProcessStartInfo {
+                FileName = psh,
+                Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " +
+                            "\"Enable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue\"",
+                UseShellExecute = false, CreateNoWindow = true
+            };
+            using (var p = Process.Start(psi)) { if (!p.WaitForExit(60000)) Log("  WARN: Enable-NetAdapterBinding(ms_tcpip6) timed out."); else Log("  re-enabled ms_tcpip6 binding on adapters."); }
+        } catch (Exception ex) { Log("  WARN: per-adapter IPv6 re-enable failed: " + ex.Message); }
     }
 
     // ── 5d. NDIS rebind: bounce physical adapters after WinDivert removal ─────

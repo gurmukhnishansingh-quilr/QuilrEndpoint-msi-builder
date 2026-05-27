@@ -120,6 +120,25 @@
     <Property Id="UNIFIEDDLP"  Secure="yes" />
     <Property Id="RUSTLOG"     Secure="yes" />
 
+    <!-- Offline / no-discovery controls.
+           SKIPDISCOVERY=1  install-launcher NEVER contacts the discovery service
+                            and does NOT validate the tenant against it. The env is
+                            taken from ENVNAME (or labelled "manual"); ALL required
+                            agent env vars must be supplied via MSI properties. The
+                            launcher fails fast if a required var is missing.
+                            Required = BACKENDURL + DLPURL (or a known ENVNAME whose
+                            URLs are derived from the built-in map).
+           AGENTENV         generic passthrough for ANY endpoint_agent_env key that
+                            has no dedicated switch, as a semicolon list:
+                            AGENTENV="OAUTH_PROVIDER=microsoft;KEY=VALUE". Works with
+                            or without SKIPDISCOVERY (merged as overrides).
+         Example (fully offline, custom backend):
+           msiexec /i quilrai-endpoint-agent.msi /qn SKIPDISCOVERY=1 ^
+                   TENANTID=<id> BACKENDURL=https://be DLPURL=https://dlp ^
+                   AGENTENV="OAUTH_PROVIDER=microsoft" -->
+    <Property Id="SKIPDISCOVERY" Secure="yes" />
+    <Property Id="AGENTENV"      Secure="yes" />
+
     <!-- Auto-updater controls. install-launcher.exe records ProductVersion to
          C:\ProgramData\QuilrAI\version and registers the QuilrAI-Endpoint-Update
          scheduled task (SYSTEM) which runs update-launcher.exe. That updater asks
@@ -292,7 +311,7 @@
 
     <CustomAction Id="RunInstallerExec"
                   FileKey="fil_InstallLauncherExe"
-                  ExeCommand="--tenant-id &quot;[TENANTID]&quot; --env-name &quot;[ENVNAME]&quot; --api-key &quot;[APIKEY]&quot; --dlp &quot;[DLPURL]&quot; --be &quot;[BACKENDURL]&quot; --tdir &quot;[TEMPLATEDIR]&quot; --ipath &quot;[INSTALLPATH]&quot; --email &quot;[WORKEMAIL]&quot; --udlp &quot;[UNIFIEDDLP]&quot; --rlog &quot;[RUSTLOG]&quot; --ver &quot;[ProductVersion]&quot; --uurl &quot;[UPDATEURL]&quot; --uint &quot;[UPDATEINTERVAL]&quot; --auto &quot;[AUTOUPDATE]&quot;"
+                  ExeCommand="--tenant-id &quot;[TENANTID]&quot; --env-name &quot;[ENVNAME]&quot; --api-key &quot;[APIKEY]&quot; --skip-discovery &quot;[SKIPDISCOVERY]&quot; --agent-env &quot;[AGENTENV]&quot; --dlp &quot;[DLPURL]&quot; --be &quot;[BACKENDURL]&quot; --tdir &quot;[TEMPLATEDIR]&quot; --ipath &quot;[INSTALLPATH]&quot; --email &quot;[WORKEMAIL]&quot; --udlp &quot;[UNIFIEDDLP]&quot; --rlog &quot;[RUSTLOG]&quot; --ver &quot;[ProductVersion]&quot; --uurl &quot;[UPDATEURL]&quot; --uint &quot;[UPDATEINTERVAL]&quot; --auto &quot;[AUTOUPDATE]&quot;"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />

@@ -164,12 +164,41 @@ Valid `ENVNAME` values (see §1 for the backend each maps to):
 | `https://platform.quilr.ai`        | `india-poc`  |
 | `https://secure.quilr.ai`          | `secure`     |
 
+### Fully offline / custom backend (`SKIPDISCOVERY`)
+
+`ENVNAME` (above) skips discovery but only works for the **known** environments in
+the built-in URL map. For a fully offline install — or a custom/self-hosted backend
+that isn't in that map — pass `SKIPDISCOVERY=1`. The installer then **never contacts
+discovery and never validates the tenant**; every agent variable must come from MSI
+properties. It **fails fast** (before touching the system) if a required variable is
+missing.
+
+Required when `SKIPDISCOVERY=1`: `BACKENDURL` **and** `DLPURL` — *or* a known
+`ENVNAME` whose URLs are derived automatically. Any other `endpoint_agent_env` key
+(e.g. `OAUTH_PROVIDER`, `ENDPOINT_AGENT_CDN_BASE_MAC`) is passed via the generic
+`AGENTENV` property as a `;`-separated `KEY=VALUE` list.
+
+```powershell
+# Fully offline, explicit URLs + extra keys -- no network at install time
+msiexec /i quilrai-endpoint-agent.msi /qn `
+        SKIPDISCOVERY=1 `
+        TENANTID=442e052d-4c60-4cdc-961e-bc9db74a40ca `
+        BACKENDURL=https://preprod.quilr.ai `
+        DLPURL=https://dlppreprod.quilr.ai `
+        AGENTENV="OAUTH_PROVIDER=microsoft;ENDPOINT_AGENT_CDN_BASE_MAC=https://quilr-extensions.quilr.ai/endpoint-agent/quilrai/preprod"
+```
+
+`AGENTENV` also works **without** `SKIPDISCOVERY` — its keys are merged as overrides
+on top of whatever discovery returns.
+
 ### MSI properties
 
 | Property   | Required for silent install | Effect                                                                 |
 |------------|-----------------------------|------------------------------------------------------------------------|
 | `TENANTID` | **Yes** (unless pre-staged) | Validated against discovery; binds the device and resolves the env     |
 | `ENVNAME`  | No                          | Pin the env, skip discovery (see above)                                |
+| `SKIPDISCOVERY` | No                     | `1` = never contact discovery / validate tenant; requires `BACKENDURL`+`DLPURL` (or known `ENVNAME`) |
+| `AGENTENV` | No                          | Extra agent env vars as `KEY=VALUE;KEY=VALUE` (merged as overrides)     |
 | `APIKEY`   | No                          | `x-api-key` for the discovery call (overrides the baked default)       |
 | `DLPURL`        | No                     | Override `QUILR_DLP_ENDPOINT`        (else discovery → env switch)      |
 | `BACKENDURL`    | No                     | Override `QUILR_BACKEND_BASE_URL`                                       |

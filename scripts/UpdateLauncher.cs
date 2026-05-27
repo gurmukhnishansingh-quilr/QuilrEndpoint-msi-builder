@@ -6,12 +6,14 @@
 // binaries in C:\Program Files\QuilrAI, then restarts the service.
 //
 // Contract (both come from discovery):
-//   * latest version  = discovery field   endpoint_agent_version_windows
-//   * download location = endpoint_agent_env["UPDATE_URL"]  (free-form key,
-//                         like OAUTH_PROVIDER); override with --update-url
-//       - if UPDATE_URL ends in ".zip" it's used as the package URL directly
+//   * latest version   = discovery field  endpoint_agent_version_windows
+//   * download location = discovery field  endpoint_agent_update_url_windows
+//                         (a direct package .zip URL); override with --update-url.
+//                         Falls back to endpoint_agent_env["UPDATE_URL"] only for
+//                         older discovery records without the dedicated field.
+//       - if the URL ends in ".zip" it's used as the package URL directly
 //       - otherwise it's treated as a base dir and the package name is derived:
-//             <UPDATE_URL>/quilrai_package_v<version>_win_release.zip
+//             <url>/quilrai_package_v<version>_win_release.zip
 //
 // Installed version is tracked in C:\ProgramData\QuilrAI\version (written by
 // install-launcher at install time and by this updater after each update).
@@ -149,12 +151,20 @@ internal static class UpdateLauncher {
             object v;
             if (root.TryGetValue("endpoint_agent_version_windows", out v) && v != null && v.ToString().Trim().Length > 0)
                 version = v.ToString().Trim();
-            object envObj;
-            if (root.TryGetValue("endpoint_agent_env", out envObj)) {
-                var env = envObj as Dictionary<string,object>;
-                object u;
-                if (env != null && env.TryGetValue("UPDATE_URL", out u) && u != null)
-                    updateUrl = u.ToString().Trim();
+            // Update URL: use the DEDICATED top-level field endpoint_agent_update_url_windows
+            // (a direct package .zip URL). Fall back to endpoint_agent_env["UPDATE_URL"]
+            // only if the dedicated field is absent (older discovery records).
+            object u;
+            if (root.TryGetValue("endpoint_agent_update_url_windows", out u) && u != null && u.ToString().Trim().Length > 0) {
+                updateUrl = u.ToString().Trim();
+            } else {
+                object envObj;
+                if (root.TryGetValue("endpoint_agent_env", out envObj)) {
+                    var env = envObj as Dictionary<string,object>;
+                    object eu;
+                    if (env != null && env.TryGetValue("UPDATE_URL", out eu) && eu != null && eu.ToString().Trim().Length > 0)
+                        updateUrl = eu.ToString().Trim();
+                }
             }
         } catch (Exception ex) { Log("WARN: discovery query failed: " + ex.Message); }
     }

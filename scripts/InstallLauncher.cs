@@ -12,20 +12,27 @@
 //   csc.exe /target:exe /optimize+ /platform:anycpu /out:install-launcher.exe
 //           /reference:System.dll InstallLauncher.cs
 //
-// MSI ExeCommand (set by WiX Product.wxs):
-//   "[#fil_InstallLauncherExe]" --tenant-id "[TENANTID]"
-//                               --env-name "[ENVNAME]"  --api-key "[APIKEY]"
+// MSI ExeCommand (set by WiX Product.wxs) -- the agent files + service are already
+// installed by the MSI; this configures the runtime and starts the service:
+//   "[#fil_InstallLauncherExe]" --tenant-id "[TENANTID]" --env-name "[ENVNAME]"
+//        --api-key "[APIKEY]" --dlp ... --be ... --agent-env "[AGENTENV]"
+//        --skip-discovery "[SKIPDISCOVERY]" --ver ... --uurl ... --auto ...
+//
+// Environment resolution (highest precedence first):
+//   * SKIPDISCOVERY=1 -> never contact discovery, never validate the tenant. The
+//       env label = ENVNAME (or "manual"); ALL required agent env vars must be
+//       supplied via MSI properties (BACKENDURL + DLPURL, or a known ENVNAME whose
+//       URLs are derived). Missing required vars => fail fast before any teardown.
+//   * ENVNAME set (no SKIPDISCOVERY) -> pin the env, derive URLs from the built-in
+//       map for the known envs; discovery validation skipped (air-gapped friendly).
+//   * otherwise -> resolve + validate the tenant against discovery (online).
 //
 // Behavior:
-//   1. install dir = directory containing this exe (the MSI staged it there)
-//   2. agent ps1 = "<installDir>\sentinel-endpoint.ps1"  (rebranded QuilrAI installer)
-//   3. agent dir = "<installDir>\agent"  (the extracted package, bundled by the MSI)
-//   4. resolve env from discovery (by tenant id) unless --env-name pins it
-//   5. Spawn powershell.exe with
-//        -File <ps1> -SourceDir <agentDir> -Env <env> -TenantId <tid> -RegisterAsService
-//      redirect stdio to a per-launch log.
-//   6. Wait. Return that process's exit code, mapped to 1603 on any error so
-//      msiexec surfaces an unambiguous failure code.
+//   1. install dir = C:\Program Files\<brand> (MSI installed the agent + service)
+//   2. resolve env (above); merge MSI-property overrides + AGENTENV passthrough
+//   3. remove any foreign CLI agent, write certs/env, configure + start the service
+//   4. write the version file + register the auto-update scheduled task
+//   Returns 1603 on any error so msiexec surfaces an unambiguous failure code.
 
 using System;
 using System.Collections.Generic;
@@ -92,6 +99,19 @@ internal static class InstallLauncher {
             CollectOverride(parsed, "udlp",  B.UnifiedDlpVar, overrides);  // UNIFIEDDLP
             CollectOverride(parsed, "rlog",  "RUST_LOG",                   overrides);  // RUSTLOG
 
+            // Generic agent-env passthrough (MSI prop AGENTENV): "K1=v1;K2=v2;..."
+            // lets operators supply ANY endpoint_agent_env key that has no dedicated
+            // switch (OAUTH_PROVIDER, ENDPOINT_AGENT_CDN_BASE_*, ...). Merged into the
+            // overrides map (highest precedence) so it works with or without discovery.
+            string agentEnvArg; parsed.TryGetValue("agent-env", out agentEnvArg);
+            MergeKvList(agentEnvArg, overrides);
+
+            // SKIPDISCOVERY=1 -> never contact discovery and never validate the tenant
+            // against it; the environment + all required agent env vars must be supplied
+            // via MSI properties (validated below). Anything else => normal discovery.
+            string skipArg; parsed.TryGetValue("skip-discovery", out skipArg);
+            bool skipDiscovery = string.Equals((skipArg ?? "").Trim(), "1", StringComparison.Ordinal);
+
             // Auto-updater wiring (MSI props ProductVersion/UPDATEURL/UPDATEINTERVAL/AUTOUPDATE).
             string agentVersion; parsed.TryGetValue("ver",  out agentVersion); agentVersion = (agentVersion ?? "").Trim();
             string updTaskUrl;   parsed.TryGetValue("uurl", out updTaskUrl);   updTaskUrl   = (updTaskUrl   ?? "").Trim();
@@ -154,7 +174,24 @@ internal static class InstallLauncher {
             Dictionary<string,string> discBrowserEnv = null, discEndpointEnv = null;
             string resolvedEnv;
 
-            if (!string.IsNullOrEmpty(envName)) {
+            if (skipDiscovery) {
+                // FULLY OFFLINE: never contact discovery, never validate the tenant.
+                // The env label comes from ENVNAME if supplied (also used as a URL
+                // fallback for the known envs); everything the agent needs must be
+                // supplied via MSI properties. Validate the required vars are present
+                // BEFORE any teardown so a missing var fails fast and harmlessly.
+                resolvedEnv = string.IsNullOrEmpty(envName) ? "manual" : envName;
+                Log("SKIPDISCOVERY=1 -- discovery + tenant validation skipped; using explicit MSI env config (env label '" + resolvedEnv + "').");
+                var missing = MissingRequiredEnv(envName, overrides);
+                if (missing.Count > 0) {
+                    LogError("SKIPDISCOVERY=1 but required agent environment variable(s) were not supplied: " + string.Join(", ", missing.ToArray()));
+                    LogError("Pass them on the msiexec line, e.g.:");
+                    LogError("  BACKENDURL=https://<backend>  DLPURL=https://<dlp>");
+                    LogError("  (or pin a known ENVNAME=<env> so the URLs are derived automatically).");
+                    LogError("Extra keys can be passed via AGENTENV=\"OAUTH_PROVIDER=microsoft;KEY=VALUE\".");
+                    return ERROR_INSTALL_FAILURE;
+                }
+            } else if (!string.IsNullOrEmpty(envName)) {
                 // PER-ENV / explicit override: env is baked/pinned. Stay offline-
                 // friendly -- no discovery requirement.
                 resolvedEnv = envName;
@@ -620,8 +657,40 @@ internal static class InstallLauncher {
         BroadcastEnvChange();
 
         ConfigureServiceRuntime(tenantId, cfg);
+        DisableIPv6();          // before starting the agent (uninstaller re-enables)
         StartAgentService();
         Log("Native config complete.");
+    }
+
+    // Disable IPv6 on the host so traffic is forced down the IPv4 path the agent's
+    // WinDivert proxy intercepts (IPv6 would otherwise bypass it). Two parts:
+    //   1. HKLM\...\Tcpip6\Parameters\DisabledComponents = 0xFF -- persistent across
+    //      reboots; this is exactly what the uninstaller's EnableIPv6 step reverses.
+    //   2. Disable the ms_tcpip6 binding on every adapter -- takes effect immediately
+    //      (no reboot), via Disable-NetAdapterBinding.
+    private static void DisableIPv6() {
+        try {
+            using (var k = Win32Registry.LocalMachine.CreateSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters")) {
+                if (k != null) {
+                    k.SetValue("DisabledComponents", unchecked((int)0xFF), Win32RegistryValueKind.DWord);
+                    Log("IPv6: set Tcpip6 DisabledComponents=0xFF (disabled across reboots).");
+                }
+            }
+        } catch (Exception ex) { Log("WARN: set DisabledComponents failed: " + ex.Message); }
+        try {
+            string psh = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                                      @"WindowsPowerShell\v1.0\powershell.exe");
+            var psi = new ProcessStartInfo {
+                FileName = psh,
+                Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " +
+                            "\"Disable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue\"",
+                UseShellExecute = false, CreateNoWindow = true
+            };
+            using (var p = Process.Start(psi)) {
+                if (!p.WaitForExit(60000)) Log("WARN: Disable-NetAdapterBinding(ms_tcpip6) timed out.");
+                else Log("IPv6: disabled ms_tcpip6 binding on all adapters (immediate).");
+            }
+        } catch (Exception ex) { Log("WARN: per-adapter IPv6 disable failed: " + ex.Message); }
     }
 
     // Effective agent config = discovery's endpoint_agent_env (authoritative),
@@ -677,6 +746,39 @@ internal static class InstallLauncher {
             case "qualtrix-secure": dlp = "https://dlpone.quilr.ai";         backend = "https://secure.quilr.ai";       return true;
             default: return false;
         }
+    }
+
+    // Parse a "K1=v1;K2=v2;..." list (AGENTENV) into the overrides map. Splits on
+    // ';' then the first '=' (values may themselves contain '='). Blank/malformed
+    // entries are skipped with a warning. Values are never logged (may be secrets).
+    private static void MergeKvList(string s, Dictionary<string,string> dst) {
+        if (string.IsNullOrEmpty(s)) return;
+        foreach (string pair in s.Split(';')) {
+            string p = (pair ?? "").Trim();
+            if (p.Length == 0) continue;
+            int eq = p.IndexOf('=');
+            if (eq <= 0) { Log("WARN: ignoring malformed AGENTENV entry (expected KEY=VALUE): " + p); continue; }
+            string k = p.Substring(0, eq).Trim();
+            string v = p.Substring(eq + 1).Trim();
+            if (k.Length > 0) { dst[k] = v; Log("AGENTENV: " + k + " supplied via MSI property."); }
+        }
+    }
+
+    // For SKIPDISCOVERY mode: which REQUIRED agent env vars cannot be resolved from
+    // the supplied overrides + the ENVNAME URL map. Required = backend + DLP endpoint
+    // (without these the agent can't reach the platform). Every other key has a safe
+    // default in BuildAgentConfig, so it is not required here.
+    private static List<string> MissingRequiredEnv(string envName, Dictionary<string,string> overrides) {
+        string dlp, backend;
+        bool known = EnvUrls(envName, out dlp, out backend);
+        var missing = new List<string>();
+        if (!(known || HasNonEmpty(overrides, "QUILR_BACKEND_BASE_URL"))) missing.Add("QUILR_BACKEND_BASE_URL (BACKENDURL)");
+        if (!(known || HasNonEmpty(overrides, "QUILR_DLP_ENDPOINT")))     missing.Add("QUILR_DLP_ENDPOINT (DLPURL)");
+        return missing;
+    }
+
+    private static bool HasNonEmpty(Dictionary<string,string> d, string k) {
+        string v; return d != null && d.TryGetValue(k, out v) && v != null && v.Trim().Length > 0;
     }
 
     private static void CopyDirContents(string src, string dest) {
@@ -862,13 +964,18 @@ internal static class InstallLauncher {
             Log("Foreign-agent check skipped (Sentinel dir is this brand's install dir).");
             return;
         }
-        bool installed = File.Exists(Path.Combine(sentinelDir, "sentinel.exe"));
-        bool proxyRunning = false;
-        try { proxyRunning = Process.GetProcessesByName("sentinel-proxy").Length > 0; } catch { }
-        if (!installed || !proxyRunning) {
-            Log("No CLI Sentinel install to remove (sentinel.exe=" + installed + ", sentinel-proxy running=" + proxyRunning + ").");
+        // Present if the dir has sentinel.exe OR the SentinelAgent service is
+        // registered. We do NOT require the proxy to be running: a stopped-but-
+        // installed CLI agent is still a stale/conflicting install to remove.
+        bool dirInstalled = File.Exists(Path.Combine(sentinelDir, "sentinel.exe"));
+        bool svcExists = FindService("SentinelAgent") != null;
+        if (!dirInstalled && !svcExists) {
+            Log("No CLI Sentinel install present (sentinel.exe=" + dirInstalled + ", SentinelAgent service=" + svcExists + ").");
             return;
         }
+        bool proxyRunning = false;
+        try { proxyRunning = Process.GetProcessesByName("sentinel-proxy").Length > 0; } catch { }
+        Log("CLI Sentinel install present (sentinel.exe=" + dirInstalled + ", service=" + svcExists + ", proxy running=" + proxyRunning + ") -- removing.");
 
         // Preferred: run the CLI install's OWN uninstaller (it ships a .ps1; the
         // .exe has no uninstall). Run via powershell.exe (.exe fallback).
