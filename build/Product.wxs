@@ -45,17 +45,38 @@
              Compressed="yes"
              InstallScope="perMachine"
              Manufacturer="Quilr, Inc."
-             Description="QuilrAI Endpoint Agent (offline installer)"
+             Description="$(var.ProductName) (offline installer)"
              Comments="Wraps the QuilrAI installer; bundles the extracted agent payload."
              Platform="x64" />
 
     <!-- Single embedded cab keeps distribution to one .msi file. -->
     <Media Id="1" Cabinet="payload.cab" EmbedCab="yes" CompressionLevel="high" />
 
-    <!-- Major upgrade: uninstall older versions cleanly when a newer MSI runs. -->
+    <!-- Major upgrade: uninstall older versions of THIS product cleanly. -->
     <MajorUpgrade
-        DowngradeErrorMessage="A newer version of QuilrAI Endpoint Agent is already installed."
+        DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed."
         Schedule="afterInstallInitialize" />
+
+    <!-- Auto-remove ANY OTHER Quilr/Sentinel endpoint agent (a different product
+         id) before installing this one, so only one agent is installed at a time.
+         RemoveExistingProducts (scheduled by MajorUpgrade, afterInstallInitialize)
+         processes these rows too, so each detected product is fully uninstalled
+         (running ITS uninstall-launcher teardown) BEFORE our files/service go down.
+         Covered: the other brand's single MSI plus the legacy per-env MSIs. SINGLE
+         mode only (per-env builds use one of these codes as their own). -->
+    <?ifndef DefaultEnv ?>
+    <Upgrade Id="$(var.CrossUpgradeCode)">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_CROSS" />
+    </Upgrade>
+    <Upgrade Id="2C9D3E5A-6F12-4E0B-9B6A-7F4A1D2E0001"><UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_E1" /></Upgrade>
+    <Upgrade Id="2C9D3E5A-6F12-4E0B-9B6A-7F4A1D2E0002"><UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_E2" /></Upgrade>
+    <Upgrade Id="2C9D3E5A-6F12-4E0B-9B6A-7F4A1D2E0003"><UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_E3" /></Upgrade>
+    <Upgrade Id="2C9D3E5A-6F12-4E0B-9B6A-7F4A1D2E0004"><UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_E4" /></Upgrade>
+    <Upgrade Id="2C9D3E5A-6F12-4E0B-9B6A-7F4A1D2E0005"><UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_E5" /></Upgrade>
+    <Upgrade Id="2C9D3E5A-6F12-4E0B-9B6A-7F4A1D2E0006"><UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_E6" /></Upgrade>
+    <Upgrade Id="2C9D3E5A-6F12-4E0B-9B6A-7F4A1D2E0007"><UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_E7" /></Upgrade>
+    <Upgrade Id="2C9D3E5A-6F12-4E0B-9B6A-7F4A1D2E0008"><UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" Property="OTHERAGENT_E8" /></Upgrade>
+    <?endif?>
 
     <!-- Properties surfaced to msiexec / Group Policy / Intune.
          Secure="yes" lets them flow into UI-restricted (silent) installs. -->
@@ -99,6 +120,18 @@
     <Property Id="UNIFIEDDLP"  Secure="yes" />
     <Property Id="RUSTLOG"     Secure="yes" />
 
+    <!-- Auto-updater controls. install-launcher.exe records ProductVersion to
+         C:\ProgramData\QuilrAI\version and registers the QuilrAI-Endpoint-Update
+         scheduled task (SYSTEM) which runs update-launcher.exe. That updater asks
+         discovery for endpoint_agent_version_windows and, if newer, downloads from
+         endpoint_agent_env["UPDATE_URL"] and swaps the binaries.
+           UPDATEURL      override the discovery UPDATE_URL (download location)
+           UPDATEINTERVAL minutes between checks (default 30; min 5)
+           AUTOUPDATE     set to 0 to NOT create the scheduled task (default: on) -->
+    <Property Id="UPDATEURL"      Secure="yes" />
+    <Property Id="UPDATEINTERVAL" Secure="yes" />
+    <Property Id="AUTOUPDATE"     Secure="yes" />
+
     <!-- perMachine is already declared on <Package InstallScope=...>, which
          emits ALLUSERS=1 and MSIINSTALLPERUSER=0 implicitly. -->
 
@@ -121,7 +154,7 @@
     <Property Id="MsiLogging" Value="voicewarmupx" />
 
     <!-- Block install when not elevated. -->
-    <Condition Message="Administrator privileges are required to install QuilrAI Endpoint Agent.">
+    <Condition Message="Administrator privileges are required to install $(var.ProductName).">
       Privileged
     </Condition>
 
@@ -135,22 +168,22 @@
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
 
-        <Directory Id="QUILRAIDIR" Name="QuilrAI">
-          <!-- quilrai.exe is authored by hand (excluded from the heat harvest by
-               exclude-quilrai-exe.xslt) so it can carry the service definition.
-               ServiceInstall creates QuilrAIAgent on install; ServiceControl
-               stops it and removes it on uninstall. MSI does NOT start the
-               service: install-launcher.exe writes the discovery-resolved env
-               block first, then starts it. -->
+        <Directory Id="QUILRAIDIR" Name="$(var.InstallDirName)">
+          <!-- The service exe is authored by hand (excluded from the heat harvest
+               by the generated exclude-service-exe XSLT) so it can carry the
+               service definition. ServiceInstall creates the service on install;
+               ServiceControl stops it and removes it on uninstall. MSI does NOT
+               start it: install-launcher.exe writes the discovery-resolved env
+               block first, then starts it. Brand vars come from candle (-d...). -->
           <Component Id="cmp_QuilrAiExe" Guid="A1B2C3D4-9999-4999-8999-999999999999" Win64="yes">
             <File Id="fil_QuilrAiExe"
-                  Source="$(var.AgentDir)\quilrai.exe"
-                  Name="quilrai.exe"
+                  Source="$(var.AgentDir)\$(var.ServiceExe)"
+                  Name="$(var.ServiceExe)"
                   KeyPath="yes" />
             <ServiceInstall Id="QuilrAIAgentServiceInstall"
-                            Name="QuilrAIAgent"
-                            DisplayName="QuilrAI Endpoint Agent"
-                            Description="QuilrAI Endpoint Agent - endpoint security and DLP enforcement."
+                            Name="$(var.ServiceName)"
+                            DisplayName="$(var.ServiceDisplay)"
+                            Description="$(var.ServiceDescription)"
                             Type="ownProcess"
                             Start="auto"
                             ErrorControl="normal"
@@ -159,7 +192,7 @@
                             Interactive="no"
                             Vital="no" />
             <ServiceControl Id="QuilrAIAgentServiceControl"
-                            Name="QuilrAIAgent"
+                            Name="$(var.ServiceName)"
                             Stop="both"
                             Remove="uninstall"
                             Wait="yes" />
@@ -182,6 +215,25 @@
               <File Id="fil_UninstallLauncherExe"
                     Source="$(var.PayloadDir)\uninstall-launcher.exe"
                     Name="uninstall-launcher.exe"
+                    KeyPath="yes" />
+            </Component>
+
+            <!-- Auto-updater. install-launcher.exe registers the QuilrAI-Endpoint-Update
+                 scheduled task to run this periodically; it asks discovery for the
+                 latest version and swaps the binaries when newer. -->
+            <Component Id="cmp_UpdateLauncherExe" Guid="A1B2C3D4-7777-4777-8777-777777777777" Win64="yes">
+              <File Id="fil_UpdateLauncherExe"
+                    Source="$(var.PayloadDir)\update-launcher.exe"
+                    Name="update-launcher.exe"
+                    KeyPath="yes" />
+            </Component>
+
+            <!-- brand.json: read by the launcher exes at runtime to select the
+                 brand's paths/service/process names. Written per build. -->
+            <Component Id="cmp_BrandJson" Guid="A1B2C3D4-AAAA-4AAA-8AAA-AAAAAAAAAAAA" Win64="yes">
+              <File Id="fil_BrandJson"
+                    Source="$(var.PayloadDir)\brand.json"
+                    Name="brand.json"
                     KeyPath="yes" />
             </Component>
 
@@ -211,7 +263,7 @@
     </Directory>
 
     <Feature Id="MainFeature"
-             Title="QuilrAI Endpoint Agent"
+             Title="$(var.ProductName)"
              Level="1"
              AllowAdvertise="no"
              Absent="disallow"
@@ -219,6 +271,8 @@
       <ComponentRef Id="cmp_QuilrAiExe" />
       <ComponentRef Id="cmp_InstallLauncherExe" />
       <ComponentRef Id="cmp_UninstallLauncherExe" />
+      <ComponentRef Id="cmp_UpdateLauncherExe" />
+      <ComponentRef Id="cmp_BrandJson" />
       <ComponentRef Id="cmp_CertsBundleZip" />
       <ComponentRef Id="cmp_VcRedistExe" />
       <!-- Remaining agent files (harvested by heat into AgentFiles-*.wxs, minus quilrai.exe). -->
@@ -238,7 +292,7 @@
 
     <CustomAction Id="RunInstallerExec"
                   FileKey="fil_InstallLauncherExe"
-                  ExeCommand="--tenant-id &quot;[TENANTID]&quot; --env-name &quot;[ENVNAME]&quot; --api-key &quot;[APIKEY]&quot; --dlp &quot;[DLPURL]&quot; --be &quot;[BACKENDURL]&quot; --tdir &quot;[TEMPLATEDIR]&quot; --ipath &quot;[INSTALLPATH]&quot; --email &quot;[WORKEMAIL]&quot; --udlp &quot;[UNIFIEDDLP]&quot; --rlog &quot;[RUSTLOG]&quot;"
+                  ExeCommand="--tenant-id &quot;[TENANTID]&quot; --env-name &quot;[ENVNAME]&quot; --api-key &quot;[APIKEY]&quot; --dlp &quot;[DLPURL]&quot; --be &quot;[BACKENDURL]&quot; --tdir &quot;[TEMPLATEDIR]&quot; --ipath &quot;[INSTALLPATH]&quot; --email &quot;[WORKEMAIL]&quot; --udlp &quot;[UNIFIEDDLP]&quot; --rlog &quot;[RUSTLOG]&quot; --ver &quot;[ProductVersion]&quot; --uurl &quot;[UPDATEURL]&quot; --uint &quot;[UPDATEINTERVAL]&quot; --auto &quot;[AUTOUPDATE]&quot;"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
@@ -302,7 +356,7 @@
 
       <!-- The custom dialog itself. -->
       <Dialog Id="TenantIdDlg" Width="370" Height="270"
-              Title="QuilrAI Endpoint Agent Setup" NoMinimize="yes">
+              Title="$(var.ProductName) Setup" NoMinimize="yes">
 
         <!-- Header band: WiX default banner BMP underneath, Quilr logo .ico
              overlaid on the right so the brand is visible on the install UI.
@@ -351,7 +405,7 @@
 
       <!-- Modal popup shown when the user clicks Install with an empty Tenant ID. -->
       <Dialog Id="InvalidTenantIdDlg" Width="260" Height="85"
-              Title="QuilrAI Endpoint Agent" NoMinimize="yes">
+              Title="$(var.ProductName)" NoMinimize="yes">
         <Control Id="Icon" Type="Icon" X="15" Y="15" Width="24" Height="24"
                  ToolTip="Error" FixedSize="yes" IconSize="32" Text="WixUI_Ico_Exclam" />
         <Control Id="Text" Type="Text" X="48" Y="15" Width="194" Height="40"

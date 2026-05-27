@@ -28,23 +28,14 @@ using System.Threading;
 using Microsoft.Win32;
 
 internal static class UninstallLauncher {
-    private const string InstallDir = @"C:\Program Files\QuilrAI";
-    private const string ServiceName = "QuilrAIAgent";
-    private const string DataDir = @"C:\ProgramData\QuilrAI";
+    // Brand (paths/service/process names) loaded from brand.json in Main.
+    // QuilrAI defaults until then. See Brand.cs.
+    private static Brand B = new Brand();
     private const string QuilrProgramData = @"C:\ProgramData\Quilr";
     private const string InstalledCertsManifest = @"C:\ProgramData\Quilr\installed_certs.txt";
     private const string LegacyUpdaterTask = "Sentinel-Endpoint-Update";
 
-    // Agent process base names (no .exe). quilrai-proxy holds the WinDivert
-    // handle; legacy sentinel* names are harmless to include (skipped if absent).
-    private static readonly string[] ProcessNames = {
-        "quilrai", "quilrai-proxy", "ipc-light-broker", "quilrai-diagnostics",
-        "templating-engine", "template-engine", "quilrai-monitor-v2", "email-discovery",
-        "quilrai-hook-client", "quilrai-claude-hook-client",
-        "sentinel", "sentinel-proxy", "sentinel-endpoint"
-    };
     private static readonly string[] WinDivertServices = { "WinDivert", "WinDivert14" };
-    private static readonly string[] WinDivertHolders = { "quilrai-proxy", "quilrai", "sentinel-proxy", "sentinel" };
     private static readonly string[] CertSubjects = {
         "Quilr EA Root CA", "Quilr EA Intermediate CA", "Quilr Proxy Root CA"
     };
@@ -85,7 +76,15 @@ internal static class UninstallLauncher {
 
         try {
             Log("================================================================");
-            Log("QuilrAI MSI uninstall launcher started (PID " + Process.GetCurrentProcess().Id + ")");
+            Log("MSI uninstall launcher started (PID " + Process.GetCurrentProcess().Id + ")");
+            // --brand-dir <dir> lets a caller (install-launcher tearing down a CLI
+            // install of ANOTHER brand) point us at a brand.json other than our own.
+            string brandDir = null;
+            for (int i = 0; i < args.Length; i++)
+                if (string.Equals(args[i], "--brand-dir", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) brandDir = args[i + 1];
+            if (string.IsNullOrEmpty(brandDir)) brandDir = Path.GetDirectoryName(Assembly.GetEntryAssembly().Location);
+            try { B = Brand.Load(brandDir); } catch { }
+            Log("Brand: service=" + B.ServiceName + " dir=" + B.InstallDir + " (brandDir=" + brandDir + ")");
 
             Step("stop service + processes", StopServiceAndProcesses);
             Step("remove certificates",      RemoveCerts);
@@ -95,7 +94,7 @@ internal static class UninstallLauncher {
             Step("remove QUIC policies",     RemoveQuicPolicies);
             Step("re-enable IPv6",           EnableIPv6);
             Step("reset network adapters",   ResetNetworkAdapters);
-            Step("remove legacy updater task", RemoveLegacyUpdaterTask);
+            Step("remove updater task(s)",   RemoveUpdaterTasks);
 
             if (s_rebootNeeded)
                 Log("NOTE: some locked items (e.g. WinDivert64.sys) are scheduled for deletion on next reboot.");
@@ -116,23 +115,23 @@ internal static class UninstallLauncher {
     }
 
     // ── 1. Service + processes ───────────────────────────────────────────────
-    // MSI's <ServiceControl> stops + removes the QuilrAIAgent service during the
-    // StopServices/DeleteServices actions, which precede this CA. So the service
-    // is normally already gone here; we just clear failure-recovery + stop it if
-    // it somehow lingers, then kill any orphaned child processes (quilrai-proxy
-    // etc.) so the WinDivert handle is released for the driver unload below.
+    // Under MSI uninstall, <ServiceControl> has usually already removed the
+    // service before this CA; but when run STANDALONE (e.g. install-launcher
+    // invoking us with --brand-dir to tear down a CLI install of another brand)
+    // nothing else removes it -- so we stop AND delete it here. sc delete is
+    // idempotent (1060 = already gone), so it's safe in both cases.
     private static void StopServiceAndProcesses() {
-        if (FindService(ServiceName) != null) {
-            RunExe("sc.exe", "failure " + ServiceName + " reset= 0 actions= \"\"");
-            RunExe("sc.exe", "stop " + ServiceName);
+        if (FindService(B.ServiceName) != null) {
+            RunExe("sc.exe", "failure " + B.ServiceName + " reset= 0 actions= \"\"");
+            RunExe("sc.exe", "stop " + B.ServiceName);
         } else {
-            Log("  " + ServiceName + " service already removed (by MSI ServiceControl) or absent.");
+            Log("  " + B.ServiceName + " service already removed or absent.");
         }
 
-        foreach (string p in ProcessNames)
+        foreach (string p in B.Processes)
             RunExe("taskkill.exe", "/F /IM " + p + ".exe");
         Thread.Sleep(2000);
-        // Service deletion is owned by MSI ServiceControl -- not done here.
+        RunExe("sc.exe", "delete " + B.ServiceName);   // idempotent; needed for standalone removal
     }
 
     // ── 2. Certificates ──────────────────────────────────────────────────────
@@ -195,12 +194,12 @@ internal static class UninstallLauncher {
 
     // ── 3. WinDivert driver ──────────────────────────────────────────────────
     private static void RemoveWinDivert() {
-        string sys = Path.Combine(InstallDir, "WinDivert64.sys");
+        string sys = Path.Combine(B.InstallDir, "WinDivert64.sys");
         foreach (string drv in WinDivertServices) {
             if (FindService(drv) == null) continue;
             Log("  WinDivert driver '" + drv + "' present -- unloading...");
             // Kill the handle holders so 'sc stop' can actually unload the driver.
-            foreach (string h in WinDivertHolders) RunExe("taskkill.exe", "/F /IM " + h + ".exe");
+            foreach (string h in B.Processes) RunExe("taskkill.exe", "/F /IM " + h + ".exe");
             RunExe("sc.exe", "stop " + drv);
 
             // Drive the unload: deleting WinDivert64.sys succeeds the moment the
@@ -220,9 +219,9 @@ internal static class UninstallLauncher {
     // ── 4. Files (with reboot-delete fallback for locked residue) ─────────────
     private static void RemoveFiles() {
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        RemoveDirSafe(InstallDir, "install dir");
-        RemoveDirSafe(Path.Combine(localAppData, ".quilrai"), "hooks dir");
-        RemoveDirSafe(DataDir, "data dir");
+        RemoveDirSafe(B.InstallDir, "install dir");
+        RemoveDirSafe(Path.Combine(localAppData, B.HooksDirName), "hooks dir");
+        RemoveDirSafe(B.DataDir, "data dir");
         RemoveDirSafe(QuilrProgramData, "Quilr ProgramData");
         // legacy dirs from older Sentinel builds
         RemoveDirSafe(Path.Combine(localAppData, "Sentinel"), "legacy Sentinel user dir");
@@ -341,8 +340,11 @@ internal static class UninstallLauncher {
         } catch (Exception ex) { Log("  WARN: adapter enumeration failed: " + ex.Message); }
     }
 
-    // ── 5e. Legacy updater scheduled task (older heavyweight installer) ───────
-    private static void RemoveLegacyUpdaterTask() {
+    // ── 5e. Updater scheduled tasks ──────────────────────────────────────────
+    // Remove the auto-updater task this MSI created, plus the legacy task from
+    // the older heavyweight installer (no-op if absent).
+    private static void RemoveUpdaterTasks() {
+        RunExe("schtasks.exe", "/Delete /TN \"" + B.UpdaterTask + "\" /F");
         RunExe("schtasks.exe", "/Delete /TN \"" + LegacyUpdaterTask + "\" /F");
     }
 

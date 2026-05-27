@@ -86,11 +86,17 @@ internal static class InstallLauncher {
             var overrides = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
             CollectOverride(parsed, "dlp",   "QUILR_DLP_ENDPOINT",         overrides);  // DLPURL
             CollectOverride(parsed, "be",    "QUILR_BACKEND_BASE_URL",     overrides);  // BACKENDURL
-            CollectOverride(parsed, "tdir",  "QUILRAI_TEMPLATE_DIR",       overrides);  // TEMPLATEDIR
-            CollectOverride(parsed, "ipath", "QUILRAI_INSTALLATION_PATH",  overrides);  // INSTALLPATH
-            CollectOverride(parsed, "email", "QUILRAI_OVERRIDE_EMAIL",     overrides);  // WORKEMAIL
-            CollectOverride(parsed, "udlp",  "QUILRAI_UNIFIED_DLP_POLICY", overrides);  // UNIFIEDDLP
+            CollectOverride(parsed, "tdir",  B.TemplateDirVar,       overrides);  // TEMPLATEDIR
+            CollectOverride(parsed, "ipath", B.InstallPathVar,  overrides);  // INSTALLPATH
+            CollectOverride(parsed, "email", B.OverrideEmailVar,     overrides);  // WORKEMAIL
+            CollectOverride(parsed, "udlp",  B.UnifiedDlpVar, overrides);  // UNIFIEDDLP
             CollectOverride(parsed, "rlog",  "RUST_LOG",                   overrides);  // RUSTLOG
+
+            // Auto-updater wiring (MSI props ProductVersion/UPDATEURL/UPDATEINTERVAL/AUTOUPDATE).
+            string agentVersion; parsed.TryGetValue("ver",  out agentVersion); agentVersion = (agentVersion ?? "").Trim();
+            string updTaskUrl;   parsed.TryGetValue("uurl", out updTaskUrl);   updTaskUrl   = (updTaskUrl   ?? "").Trim();
+            string updInterval;  parsed.TryGetValue("uint", out updInterval);  updInterval  = (updInterval  ?? "").Trim();
+            string autoUpdate;   parsed.TryGetValue("auto", out autoUpdate);   autoUpdate   = (autoUpdate   ?? "").Trim();
 
             Log("Env name: "  + (string.IsNullOrEmpty(envName)  ? "<empty>" : envName));
             Log("TenantId:  " + (string.IsNullOrEmpty(tenantId) ? "<empty>" : "<provided>"));
@@ -102,18 +108,22 @@ internal static class InstallLauncher {
             string installerDir = Path.GetDirectoryName(exePath);
             Log("Installer (helper) dir: " + installerDir);
 
+            // Brand config (quilrai vs sentinel) from the bundled brand.json.
+            B = Brand.Load(installerDir);
+            Log("Brand: service=" + B.ServiceName + " exe=" + B.ServiceExe + " dir=" + B.InstallDir);
+
             // The agent itself was installed by MSI directly to C:\Program Files\QuilrAI
             // (and the QuilrAIAgent service created via ServiceInstall). Confirm it landed.
-            if (!File.Exists(Path.Combine(AgentInstallDir, "quilrai.exe"))) {
-                LogError("Agent not found at " + AgentInstallDir + "\\quilrai.exe (MSI file install may have failed).");
+            if (!File.Exists(Path.Combine(B.InstallDir, B.ServiceExe))) {
+                LogError("Agent not found at " + B.InstallDir + "\\" + B.ServiceExe + " (MSI file install may have failed).");
                 return ERROR_INSTALL_FAILURE;
             }
-            Log("Agent install dir: " + AgentInstallDir);
+            Log("Agent install dir: " + B.InstallDir);
 
             // TenantId gating: must come from MSI arg, env var, or pre-staged file.
             if (string.IsNullOrEmpty(tenantId)) {
                 string envTenant = Environment.GetEnvironmentVariable("QUILR_TENANT_ID");
-                string preStaged = @"C:\ProgramData\QuilrAI\tenant_id";
+                string preStaged = B.TenantFile;
                 if (!string.IsNullOrEmpty(envTenant)) {
                     Log("TenantId will come from QUILR_TENANT_ID env var.");
                 } else if (File.Exists(preStaged)) {
@@ -137,7 +147,7 @@ internal static class InstallLauncher {
                 string envTenant = Environment.GetEnvironmentVariable("QUILR_TENANT_ID");
                 effectiveTenant = (envTenant ?? "").Trim();
                 if (string.IsNullOrEmpty(effectiveTenant)) {
-                    string preStaged = @"C:\ProgramData\QuilrAI\tenant_id";
+                    string preStaged = B.TenantFile;
                     if (File.Exists(preStaged)) { try { effectiveTenant = File.ReadAllText(preStaged).Trim(); } catch { } }
                 }
             }
@@ -178,6 +188,18 @@ internal static class InstallLauncher {
                 Log("Tenant validated and environment resolved: " + resolvedEnv);
             }
 
+            // Remove a NON-MSI (CLI) Sentinel install if present -- BEFORE we write
+            // our config/certs (the foreign teardown removes shared Quilr CA certs +
+            // env, which we then (re)establish below). MSI Sentinels were already
+            // removed by the <Upgrade> cross-removal, so a Sentinel still on disk here
+            // with a live proxy is the CLI install. Runs after discovery so the
+            // teardown's NDIS reset can't disrupt our discovery call.
+            try {
+                RemoveForeignCliAgent(installerDir);
+            } catch (Exception ex) {
+                Log("WARN: foreign CLI agent removal threw: " + ex.Message);
+            }
+
             WriteEnvToRegistry(resolvedEnv);
 
             // Browser-extension env vars go machine-wide here. The endpoint_agent_env
@@ -213,6 +235,16 @@ internal static class InstallLauncher {
             } catch (Exception ex) {
                 LogError("Native agent configuration failed: " + ex);
                 return ERROR_INSTALL_FAILURE;
+            }
+
+            // Record the installed version (so the updater can compare) and register
+            // the auto-update scheduled task that runs update-launcher.exe.
+            try { WriteVersionFile(agentVersion); } catch (Exception ex) { Log("WARN: version file: " + ex.Message); }
+            if (!string.Equals(autoUpdate, "0", StringComparison.Ordinal)) {
+                try { RegisterUpdaterTask(installerDir, updInterval, updTaskUrl); }
+                catch (Exception ex) { Log("WARN: updater task registration: " + ex.Message); }
+            } else {
+                Log("Auto-update disabled (AUTOUPDATE=0) -- no scheduled task created.");
             }
 
             Log("QuilrAI MSI install launcher completed OK");
@@ -551,13 +583,13 @@ internal static class InstallLauncher {
     //
     // Mirrors the relevant parts of source/sentinel_installer.ps1 -- keep in sync.
 
-    private const string AgentInstallDir = @"C:\Program Files\QuilrAI";
-    private const string AgentServiceName = "QuilrAIAgent";
-    private const string AgentDataDir = @"C:\ProgramData\QuilrAI";
+    // Brand (paths/service/exe names) -- loaded from brand.json next to this exe
+    // in Main. QuilrAI defaults until then. See Brand.cs.
+    private static Brand B = new Brand();
 
     private static void ConfigureAndStartAgent(string env, string tenantId,
             Dictionary<string,string> discEndpointEnv, Dictionary<string,string> overrides) {
-        string userDir = InstallHooks(AgentInstallDir);   // returns the .quilrai dir
+        string userDir = InstallHooks(B.InstallDir);   // returns the .quilrai dir
 
         // Build the effective agent config. Precedence, highest first:
         //   1. explicit MSI-property overrides (command line / GPO / Intune)
@@ -575,14 +607,14 @@ internal static class InstallLauncher {
         foreach (var kv in cfg) Log("  " + kv.Key + "=" + kv.Value);
 
         PersistTenant(tenantId);
-        SetNodeCaEnv(AgentInstallDir);
+        SetNodeCaEnv(B.InstallDir);
 
         // Publish the effective config at Machine scope (these are the values that
         // land in System env -- now exactly matching discovery / the overrides).
         foreach (var kv in cfg) SetMachineEnv(kv.Key, kv.Value);
         // These are only set when supplied (override) -- otherwise clear any stale value.
-        if (!cfg.ContainsKey("QUILRAI_OVERRIDE_EMAIL"))    SetMachineEnv("QUILRAI_OVERRIDE_EMAIL", null);
-        if (!cfg.ContainsKey("QUILRAI_UNIFIED_DLP_POLICY")) SetMachineEnv("QUILRAI_UNIFIED_DLP_POLICY", null);
+        if (!cfg.ContainsKey(B.OverrideEmailVar))    SetMachineEnv(B.OverrideEmailVar, null);
+        if (!cfg.ContainsKey(B.UnifiedDlpVar)) SetMachineEnv(B.UnifiedDlpVar, null);
         // SetNodeCaEnv + the loop above wrote the registry directly (fast, no per-call
         // broadcast). Notify the system ONCE so new processes see the new env.
         BroadcastEnvChange();
@@ -611,10 +643,10 @@ internal static class InstallLauncher {
         } else if (!cfg.ContainsKey("QUILR_BACKEND_BASE_URL")) {
             Log("WARN: env '" + env + "' unknown and discovery gave no backend URL -- agent config may be incomplete.");
         }
-        if (!cfg.ContainsKey("QUILRAI_TEMPLATE_DIR"))
-            cfg["QUILRAI_TEMPLATE_DIR"] = Path.Combine(AgentInstallDir, @"templates\app-discovery");
-        if (!cfg.ContainsKey("QUILRAI_INSTALLATION_PATH"))
-            cfg["QUILRAI_INSTALLATION_PATH"] = userDir;
+        if (!cfg.ContainsKey(B.TemplateDirVar))
+            cfg[B.TemplateDirVar] = Path.Combine(B.InstallDir, @"templates\app-discovery");
+        if (!cfg.ContainsKey(B.InstallPathVar))
+            cfg[B.InstallPathVar] = userDir;
         if (!cfg.ContainsKey("RUST_LOG"))
             cfg["RUST_LOG"] = "info";
         return cfg;
@@ -660,9 +692,9 @@ internal static class InstallLauncher {
 
     private static void PersistTenant(string tenantId) {
         if (string.IsNullOrEmpty(tenantId)) { Log("No tenant id to persist."); return; }
-        if (!Directory.Exists(AgentDataDir)) Directory.CreateDirectory(AgentDataDir);
-        File.WriteAllText(Path.Combine(AgentDataDir, "tenant_id"), tenantId, new UTF8Encoding(false));
-        Log("Tenant id persisted to " + AgentDataDir + "\\tenant_id");
+        if (!Directory.Exists(B.DataDir)) Directory.CreateDirectory(B.DataDir);
+        File.WriteAllText(Path.Combine(B.DataDir, "tenant_id"), tenantId, new UTF8Encoding(false));
+        Log("Tenant id persisted to " + B.DataDir + "\\tenant_id");
     }
 
     // Hooks: copy <install>\hooks\* -> %LOCALAPPDATA%\.quilrai. The hooks/ dir
@@ -672,7 +704,7 @@ internal static class InstallLauncher {
     // PS1's behaviour under the MSI.
     private static string InstallHooks(string installDir) {
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string userDir = Path.Combine(localAppData, ".quilrai");
+        string userDir = Path.Combine(localAppData, B.HooksDirName);
         string hooksSrc = Path.Combine(installDir, "hooks");
         if (Directory.Exists(hooksSrc)) {
             Log("Installing hooks -> " + userDir);
@@ -732,19 +764,19 @@ internal static class InstallLauncher {
     // built in BuildAgentConfig), so the service sees exactly the same values that
     // were published to System env. The service exists by now (After InstallServices).
     private static void ConfigureServiceRuntime(string tenantId, Dictionary<string,string> cfg) {
-        if (FindService(AgentServiceName) == null) {
-            Log("WARN: " + AgentServiceName + " not present (MSI ServiceInstall may have failed) -- skipping runtime config.");
+        if (FindService(B.ServiceName) == null) {
+            Log("WARN: " + B.ServiceName + " not present (MSI ServiceInstall may have failed) -- skipping runtime config.");
             return;
         }
 
         // Failure recovery: restart 3x @5s, reset counter daily. Simple args, no quoting.
-        RunExe("sc.exe", "failure " + AgentServiceName + " reset= 86400 actions= restart/5000/restart/5000/restart/5000");
-        RunExe("sc.exe", "failureflag " + AgentServiceName + " 1");
+        RunExe("sc.exe", "failure " + B.ServiceName + " reset= 86400 actions= restart/5000/restart/5000/restart/5000");
+        RunExe("sc.exe", "failureflag " + B.ServiceName + " 1");
 
-        string logDir = Path.Combine(AgentDataDir, "logs");
+        string logDir = Path.Combine(B.DataDir, "logs");
         if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir);
 
-        string svcKey = @"SYSTEM\CurrentControlSet\Services\" + AgentServiceName;
+        string svcKey = @"SYSTEM\CurrentControlSet\Services\" + B.ServiceName;
         using (var k = Win32Registry.LocalMachine.OpenSubKey(svcKey, true)) {
             if (k == null) { Log("WARN: service key not found to write Environment."); return; }
             // Drop a stale Environment subkey from older installs (SCM never read it).
@@ -769,28 +801,28 @@ internal static class InstallLauncher {
     }
 
     private static void StartAgentService() {
-        var svc = FindService(AgentServiceName);
-        if (svc == null) { Log("WARN: cannot start -- " + AgentServiceName + " not registered."); return; }
+        var svc = FindService(B.ServiceName);
+        if (svc == null) { Log("WARN: cannot start -- " + B.ServiceName + " not registered."); return; }
         try {
-            if (svc.Status == ServiceControllerStatus.Running) { Log(AgentServiceName + " already running."); return; }
-            Log("Starting " + AgentServiceName + " service...");
+            if (svc.Status == ServiceControllerStatus.Running) { Log(B.ServiceName + " already running."); return; }
+            Log("Starting " + B.ServiceName + " service...");
             svc.Start();
             svc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
             svc.Refresh();
             if (svc.Status == ServiceControllerStatus.Running) {
-                Log(AgentServiceName + " is running.");
+                Log(B.ServiceName + " is running.");
             } else {
-                Log("WARN: " + AgentServiceName + " status after start: " + svc.Status);
+                Log("WARN: " + B.ServiceName + " status after start: " + svc.Status);
             }
         } catch (Exception ex) {
             // Non-fatal: files are installed; surface why it didn't come up.
-            Log("WARN: " + AgentServiceName + " did not reach Running: " + ex.Message);
-            string q = RunExe("sc.exe", "query " + AgentServiceName);
+            Log("WARN: " + B.ServiceName + " did not reach Running: " + ex.Message);
+            string q = RunExe("sc.exe", "query " + B.ServiceName);
             if (!string.IsNullOrEmpty(q)) {
                 foreach (string l in q.Split('\n'))
                     if (l.IndexOf("EXIT_CODE", StringComparison.OrdinalIgnoreCase) >= 0) Log("  " + l.Trim());
             }
-            string agentLog = Path.Combine(AgentDataDir, @"logs\quilrai.log");
+            string agentLog = Path.Combine(B.DataDir, "logs", Path.GetFileNameWithoutExtension(B.ServiceExe) + ".log");
             if (File.Exists(agentLog)) {
                 try {
                     string[] all = File.ReadAllLines(agentLog);
@@ -799,7 +831,7 @@ internal static class InstallLauncher {
                     for (int i = from; i < all.Length; i++) Log("    " + all[i]);
                 } catch { }
             }
-            Log("  Retry: Start-Service " + AgentServiceName + "  (check " + agentLog + ")");
+            Log("  Retry: Start-Service " + B.ServiceName + "  (check " + agentLog + ")");
         } finally {
             svc.Close();
         }
@@ -813,9 +845,180 @@ internal static class InstallLauncher {
         return null;
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Foreign (non-MSI / CLI) agent removal
+    // ─────────────────────────────────────────────────────────────────────
+    // If a CLI-installed Sentinel agent is present -- C:\Program Files\Sentinel
+    // has sentinel.exe AND sentinel-proxy.exe is running -- run its own uninstaller
+    // under C:\Program Files\Quilr\sentinel-endpoint\ (the CLI ships it as a PS1,
+    // sentinel-endpoint-uninstaller.ps1, run via powershell.exe; .exe fallback) before
+    // we start our agent. MSI Sentinels were already removed by the <Upgrade>
+    // cross-removal, so a Sentinel still here is the non-MSI/CLI install.
+    // Skipped if that dir IS our own install dir (don't remove ourselves).
+    private static void RemoveForeignCliAgent(string installerDir) {
+        string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string sentinelDir = Path.Combine(pf, "Sentinel");
+        if (string.Equals(sentinelDir, B.InstallDir, StringComparison.OrdinalIgnoreCase)) {
+            Log("Foreign-agent check skipped (Sentinel dir is this brand's install dir).");
+            return;
+        }
+        bool installed = File.Exists(Path.Combine(sentinelDir, "sentinel.exe"));
+        bool proxyRunning = false;
+        try { proxyRunning = Process.GetProcessesByName("sentinel-proxy").Length > 0; } catch { }
+        if (!installed || !proxyRunning) {
+            Log("No CLI Sentinel install to remove (sentinel.exe=" + installed + ", sentinel-proxy running=" + proxyRunning + ").");
+            return;
+        }
+
+        // Preferred: run the CLI install's OWN uninstaller (it ships a .ps1; the
+        // .exe has no uninstall). Run via powershell.exe (.exe fallback).
+        string dir = Path.Combine(pf, @"Quilr\sentinel-endpoint");
+        string ps1 = Path.Combine(dir, "sentinel-endpoint-uninstaller.ps1");
+        string exe = Path.Combine(dir, "sentinel-endpoint-uninstaller.exe");
+        ProcessStartInfo psi = null;
+        if (File.Exists(ps1)) {
+            string psh = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                                      @"WindowsPowerShell\v1.0\powershell.exe");
+            psi = new ProcessStartInfo {
+                FileName = psh,
+                Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + ps1 + "\"",
+                UseShellExecute = false, CreateNoWindow = true
+            };
+            Log("CLI Sentinel install detected (" + sentinelDir + " + running sentinel-proxy). Running its uninstaller PS1: " + ps1);
+        } else if (File.Exists(exe)) {
+            psi = new ProcessStartInfo { FileName = exe, UseShellExecute = false, CreateNoWindow = true };
+            Log("CLI Sentinel install detected. Running its uninstaller exe: " + exe);
+        }
+
+        if (psi != null) {
+            try {
+                using (var p = Process.Start(psi)) {
+                    if (!p.WaitForExit(300000)) Log("WARN: CLI uninstaller still running after 300s -- continuing.");
+                    else Log("CLI Sentinel uninstaller exit code: " + p.ExitCode);
+                }
+                // If it actually removed things, the service+proxy should be gone now.
+                if (FindService("SentinelAgent") == null && Process.GetProcessesByName("sentinel-proxy").Length == 0) {
+                    Log("CLI Sentinel removed by its own uninstaller."); return;
+                }
+                Log("CLI uninstaller ran but Sentinel agent still present -- using native fallback.");
+            } catch (Exception ex) {
+                Log("WARN: CLI uninstaller failed (" + ex.Message + ") -- using native fallback.");
+            }
+        } else {
+            Log("CLI Sentinel install detected but no bundled uninstaller (.ps1/.exe) at " + dir + " -- using native fallback.");
+        }
+
+        // Fallback: no (working) CLI uninstaller -- tear it down with OUR native
+        // uninstall-launcher.exe pointed at a Sentinel brand.json. This stops+deletes
+        // SentinelAgent, kills sentinel* processes, unloads WinDivert, and removes
+        // C:\Program Files\Sentinel + its data/hooks/certs/env, even with no CLI uninstaller.
+        NativeForeignUninstall(installerDir);
+    }
+
+    // Sentinel brand for the native fallback (matches build-msi $BrandSentinel).
+    private const string SentinelBrandJson =
+        "{\"ServiceExe\":\"sentinel.exe\",\"ServiceName\":\"SentinelAgent\"," +
+        "\"ServiceDisplay\":\"Sentinel Endpoint Agent\",\"InstallDir\":\"C:\\\\Program Files\\\\Sentinel\"," +
+        "\"DataDir\":\"C:\\\\ProgramData\\\\Sentinel\",\"HooksDirName\":\".sentinel\",\"EnvPrefix\":\"SENTINEL_\"," +
+        "\"PackagePrefix\":\"sentinel_package\",\"UpdaterTask\":\"Sentinel-Endpoint-Update\"," +
+        "\"Processes\":[\"sentinel\",\"sentinel-proxy\",\"ipc-light-broker\",\"sentinel-diagnostics\"," +
+        "\"templating-engine\",\"template-engine\",\"sentinel-monitor-v2\",\"email-discovery\"," +
+        "\"sentinel-hook-client\",\"sentinel-claude-hook-client\"]}";
+
+    private static void NativeForeignUninstall(string installerDir) {
+        string uninstaller = Path.Combine(installerDir, "uninstall-launcher.exe");
+        if (!File.Exists(uninstaller)) { Log("WARN: uninstall-launcher.exe not found at " + uninstaller + " -- cannot remove CLI agent."); return; }
+        string brandDir = Path.Combine(Path.GetTempPath(), "quilr-foreign-brand-" + Guid.NewGuid().ToString("N"));
+        try {
+            Directory.CreateDirectory(brandDir);
+            File.WriteAllText(Path.Combine(brandDir, "brand.json"), SentinelBrandJson, new UTF8Encoding(false));
+            Log("Native fallback: running uninstall-launcher.exe (Sentinel brand) to remove the CLI install...");
+            var psi = new ProcessStartInfo {
+                FileName = uninstaller,
+                Arguments = "--brand-dir \"" + brandDir + "\"",
+                UseShellExecute = false, CreateNoWindow = true
+            };
+            using (var p = Process.Start(psi)) {
+                if (!p.WaitForExit(300000)) Log("WARN: native foreign uninstall still running after 300s -- continuing.");
+                else Log("Native foreign uninstall exit code: " + p.ExitCode);
+            }
+        } catch (Exception ex) {
+            Log("WARN: native foreign uninstall failed: " + ex.Message);
+        } finally {
+            try { Directory.Delete(brandDir, true); } catch { }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Auto-updater wiring
+    // ─────────────────────────────────────────────────────────────────────
+    // Record the installed version so update-launcher.exe can compare against
+    // discovery's endpoint_agent_version_windows.
+    private static void WriteVersionFile(string version) {
+        if (string.IsNullOrEmpty(version)) { Log("No ProductVersion supplied -- skipping version file."); return; }
+        if (!Directory.Exists(B.DataDir)) Directory.CreateDirectory(B.DataDir);
+        File.WriteAllText(Path.Combine(B.DataDir, "version"), version, new UTF8Encoding(false));
+        Log("Recorded installed version " + version + " (" + B.DataDir + "\\version).");
+    }
+
+    // Register the SYSTEM scheduled task that runs update-launcher.exe every
+    // <interval> minutes. Uses schtasks /XML so the exe path + args need no shell
+    // quoting. An UPDATE_URL override is baked into the task args; otherwise the
+    // updater reads UPDATE_URL from discovery at run time.
+    private static void RegisterUpdaterTask(string installerDir, string intervalStr, string updateUrlOverride) {
+        string exe = Path.Combine(installerDir, "update-launcher.exe");
+        if (!File.Exists(exe)) { Log("WARN: update-launcher.exe not found at " + exe + " -- skipping updater task."); return; }
+        int interval; if (!int.TryParse(intervalStr, out interval) || interval < 5) interval = 30;
+        string args = string.IsNullOrEmpty(updateUrlOverride) ? "" : ("--update-url \"" + updateUrlOverride + "\"");
+        string startBoundary = DateTime.Now.AddMinutes(2).ToString("yyyy-MM-ddTHH:mm:ss");
+
+        string xml = BuildTaskXml(exe, args, interval, startBoundary);
+        string tmp = Path.Combine(Path.GetTempPath(), "quilrai-updater-task-" + Guid.NewGuid().ToString("N") + ".xml");
+        try {
+            File.WriteAllText(tmp, xml, new UnicodeEncoding(false, true));   // UTF-16 LE + BOM (Task Scheduler requires)
+            string outp = RunExe("schtasks.exe", "/Create /TN \"" + B.UpdaterTask + "\" /XML \"" + tmp + "\" /F");
+            string q = RunExe("schtasks.exe", "/Query /TN \"" + B.UpdaterTask + "\"");
+            if (q.IndexOf(B.UpdaterTask, StringComparison.OrdinalIgnoreCase) >= 0)
+                Log("Registered auto-updater task '" + B.UpdaterTask + "' (every " + interval + " min, SYSTEM).");
+            else
+                Log("WARN: updater task not present after create. schtasks: " + outp.Trim());
+        } finally { try { File.Delete(tmp); } catch { } }
+    }
+
+    private static string BuildTaskXml(string command, string arguments, int intervalMin, string startBoundary) {
+        string cmdEsc  = System.Security.SecurityElement.Escape(command);
+        string argsEsc = System.Security.SecurityElement.Escape(arguments ?? "");
+        string argsElem = string.IsNullOrEmpty(arguments) ? "" : ("<Arguments>" + argsEsc + "</Arguments>");
+        return
+"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+"  <Triggers>\r\n" +
+"    <TimeTrigger>\r\n" +
+"      <Repetition><Interval>PT" + intervalMin + "M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>\r\n" +
+"      <StartBoundary>" + startBoundary + "</StartBoundary>\r\n" +
+"      <Enabled>true</Enabled>\r\n" +
+"    </TimeTrigger>\r\n" +
+"  </Triggers>\r\n" +
+"  <Principals>\r\n" +
+"    <Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal>\r\n" +
+"  </Principals>\r\n" +
+"  <Settings>\r\n" +
+"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
+"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
+"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
+"    <StartWhenAvailable>true</StartWhenAvailable>\r\n" +
+"    <Enabled>true</Enabled>\r\n" +
+"    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>\r\n" +
+"  </Settings>\r\n" +
+"  <Actions Context=\"Author\">\r\n" +
+"    <Exec><Command>" + cmdEsc + "</Command>" + argsElem + "</Exec>\r\n" +
+"  </Actions>\r\n" +
+"</Task>";
+    }
+
     // Run a native exe, capture combined output, log on non-zero exit. Used for
-    // taskkill / sc.exe calls whose args have NO embedded quotes (so a plain
-    // Arguments string is unambiguous).
+    // taskkill / sc.exe / schtasks calls whose args have NO ambiguous embedded
+    // quoting (paths in %TEMP% / fixed names).
     private static string RunExe(string file, string args) {
         try {
             var psi = new ProcessStartInfo {

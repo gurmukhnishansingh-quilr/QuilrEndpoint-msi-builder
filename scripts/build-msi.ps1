@@ -36,6 +36,10 @@ param(
     [string]$PackageZip,    # agent package to extract + bundle (default: signed v0.30.293)
     [switch]$Force,         # re-download the agent ZIP even if cached
     [switch]$Clean,
+    # -Name: override the product display name (ARP) AND the output filename for
+    # this build (e.g. -Name QuilrAI -> ARP "QuilrAI", out\QuilrAI.msi). Defaults
+    # to the brand's name (e.g. "QuilrAI Endpoint Agent" / quilrai-endpoint-agent.msi).
+    [string]$Name,
     # Use the launcher EXEs already in build\launchers\ AS-IS (do not recompile).
     # Drop your code-signed install-launcher.exe / uninstall-launcher.exe there
     # first, then build with -SignedLaunchers so the signature is preserved.
@@ -48,6 +52,62 @@ $AgentCdnBase = 'https://quilr-extensions.quilr.ai/endpoint-agent/preprod'
 
 # Single-package UpgradeCode (env-agnostic). NEVER change.
 $SingleUpgradeCode = '9F3B7C21-5D84-4A6E-B0C2-1E7A9D34F5B0'
+
+# --- Brands -----------------------------------------------------------------
+# The builder detects the brand from the agent package (which service exe is at
+# the package root) and parameterizes the launchers (via bundled brand.json),
+# the WiX (service exe/name/dir), the output filename, and the UpgradeCode.
+# QuilrAI and Sentinel install as DISTINCT products (separate UpgradeCodes) and
+# can coexist. UpgradeCodes are stable -- NEVER change them.
+$BrandQuilrAI = @{
+    Key                = 'quilrai'
+    ServiceExe         = 'quilrai.exe'
+    ServiceName        = 'QuilrAIAgent'
+    ServiceDisplay     = 'QuilrAI Endpoint Agent'
+    ServiceDescription = 'QuilrAI Endpoint Agent - endpoint security and DLP enforcement.'
+    InstallDir         = 'C:\Program Files\QuilrAI'
+    InstallDirName     = 'QuilrAI'
+    DataDir            = 'C:\ProgramData\QuilrAI'
+    HooksDirName       = '.quilrai'
+    EnvPrefix          = 'QUILRAI_'
+    PackagePrefix      = 'quilrai_package'
+    UpdaterTask        = 'QuilrAI-Endpoint-Update'
+    ProductName        = 'QuilrAI Endpoint Agent'
+    OutputBase         = 'quilrai-endpoint-agent'
+    UpgradeCode        = '9F3B7C21-5D84-4A6E-B0C2-1E7A9D34F5B0'
+    Processes          = @('quilrai','quilrai-proxy','ipc-light-broker','quilrai-diagnostics','templating-engine','template-engine','quilrai-monitor-v2','email-discovery','quilrai-hook-client','quilrai-claude-hook-client')
+}
+$BrandSentinel = @{
+    Key                = 'sentinel'
+    ServiceExe         = 'sentinel.exe'
+    ServiceName        = 'SentinelAgent'
+    ServiceDisplay     = 'Sentinel Endpoint Agent'
+    ServiceDescription = 'Sentinel Endpoint Agent - endpoint security and DLP enforcement.'
+    InstallDir         = 'C:\Program Files\Sentinel'
+    InstallDirName     = 'Sentinel'
+    DataDir            = 'C:\ProgramData\Sentinel'
+    HooksDirName       = '.sentinel'
+    EnvPrefix          = 'SENTINEL_'
+    PackagePrefix      = 'sentinel_package'
+    UpdaterTask        = 'Sentinel-Endpoint-Update'
+    ProductName        = 'Sentinel Endpoint Agent'
+    OutputBase         = 'sentinel-endpoint-agent'
+    UpgradeCode        = '7B1E9F4A-2C83-4D6E-A0B5-3F9C1E7D2A60'
+    Processes          = @('sentinel','sentinel-proxy','ipc-light-broker','sentinel-diagnostics','templating-engine','template-engine','sentinel-monitor-v2','email-discovery','sentinel-hook-client','sentinel-claude-hook-client')
+}
+
+# Detect the brand by peeking at the service exe at the package root.
+function Get-Brand {
+    param([string]$PackageZip)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $a = [IO.Compression.ZipFile]::OpenRead($PackageZip)
+    try {
+        $names = $a.Entries | ForEach-Object { $_.FullName }
+    } finally { $a.Dispose() }
+    if ($names -contains 'quilrai.exe')  { return $BrandQuilrAI }
+    if ($names -contains 'sentinel.exe') { return $BrandSentinel }
+    throw "Package has neither quilrai.exe nor sentinel.exe at its root: $PackageZip"
+}
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -161,12 +221,13 @@ if (-not $csc) { throw "csc.exe (.NET Framework 4.x) not found. Install .NET Fra
 Write-Host "[+] csc:    $csc"
 
 # --- Source files (shared across envs) --------------------------------------
-# Install and uninstall are both fully native (C# launchers); the MSI ships no
-# PowerShell scripts.
-$srcInstallLauncher  = Join-Path $scriptsDir 'InstallLauncher.cs'
+# Install, uninstall, and update are all fully native (C# launchers); the MSI
+# ships no PowerShell scripts.
+$srcInstallLauncher   = Join-Path $scriptsDir 'InstallLauncher.cs'
 $srcUninstallLauncher = Join-Path $scriptsDir 'UninstallLauncher.cs'
+$srcUpdateLauncher    = Join-Path $scriptsDir 'UpdateLauncher.cs'
 
-foreach ($p in @($srcInstallLauncher, $srcUninstallLauncher)) {
+foreach ($p in @($srcInstallLauncher, $srcUninstallLauncher, $srcUpdateLauncher)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "Missing required file: $p" }
 }
 
@@ -205,18 +266,22 @@ function Compile-Launcher {
         return $src
     }
 
-    # Rebuild if source newer than exe, or exe missing
+    # Each launcher is compiled together with Brand.cs (shared brand config).
+    $brandCs = Join-Path $scriptsDir 'Brand.cs'
+    # Rebuild if either source is newer than the exe, or the exe is missing.
     $rebuild = $true
     if (Test-Path -LiteralPath $exePath) {
         $srcMtime = (Get-Item $CsFile).LastWriteTimeUtc
+        $brandMtime = if (Test-Path -LiteralPath $brandCs) { (Get-Item $brandCs).LastWriteTimeUtc } else { [datetime]::MinValue }
+        $newestSrc = if ($brandMtime -gt $srcMtime) { $brandMtime } else { $srcMtime }
         $exeMtime = (Get-Item $exePath).LastWriteTimeUtc
-        if ($exeMtime -gt $srcMtime) { $rebuild = $false }
+        if ($exeMtime -gt $newestSrc) { $rebuild = $false }
     }
     if (-not $rebuild) {
         Write-Host "    cached:  $exePath"
         return $exePath
     }
-    Write-Host "    compile: $CsFile -> $exePath"
+    Write-Host "    compile: $CsFile (+Brand.cs) -> $exePath"
     $cscArgs = @(
         '/nologo',
         '/target:winexe',                                  # Windows subsystem -- no console flash when spawned
@@ -225,11 +290,12 @@ function Compile-Launcher {
         '/reference:System.dll',
         '/reference:System.IO.Compression.dll',           # ZipFile lives here on .NET 4.5+
         '/reference:System.IO.Compression.FileSystem.dll', # ZipFile.ExtractToDirectory extension
-        '/reference:System.Web.Extensions.dll',           # JavaScriptSerializer (discovery JSON)
+        '/reference:System.Web.Extensions.dll',           # JavaScriptSerializer (discovery JSON + brand.json)
         '/reference:System.ServiceProcess.dll',           # ServiceController (start/stop the agent service)
         '/reference:System.Management.dll',               # WMI Win32_NetworkAdapter (NDIS rebind on uninstall)
         "/out:$exePath",
-        $CsFile
+        $CsFile,
+        $brandCs
     )
     & $csc @cscArgs 2>&1 | ForEach-Object { Write-Host "      $_" }
     if ($LASTEXITCODE -ne 0) { throw "csc.exe failed for $CsFile (exit $LASTEXITCODE)" }
@@ -237,6 +303,7 @@ function Compile-Launcher {
 }
 
 Write-Host $(if ($SignedLaunchers) { '[*] Using pre-supplied (signed) launchers...' } else { '[*] Compiling launchers...' })
+$updateLauncherExe    = Compile-Launcher -CsFile $srcUpdateLauncher    -ExeName 'update-launcher.exe'
 $installLauncherExe   = Compile-Launcher -CsFile $srcInstallLauncher   -ExeName 'install-launcher.exe'
 $uninstallLauncherExe = Compile-Launcher -CsFile $srcUninstallLauncher -ExeName 'uninstall-launcher.exe'
 
@@ -381,6 +448,29 @@ function Build-Msi {
     Write-Host "    agent package: $pkgPath"
     Write-Host "    agent version: $resolvedVersion"
 
+    # Brand: detected from the package (quilrai.exe vs sentinel.exe at root).
+    # Drives the service exe/name, install dir, output name, and UpgradeCode.
+    $brand = Get-Brand $pkgPath
+    Write-Host "    brand:         $($brand.Key)  (service $($brand.ServiceName), $($brand.InstallDir))"
+    if ($isPerEnv) {
+        $ProductName = "$($brand.ProductName) ($EnvName)"   # per-env UpgradeCode stays as passed
+    } else {
+        $ProductName = $brand.ProductName
+        $UpgradeCode = $brand.UpgradeCode
+    }
+    # The OTHER brand's single UpgradeCode -- so this MSI auto-removes the other
+    # agent (e.g. installing QuilrAI removes a Sentinel install) before installing.
+    $crossUpgradeCode = if ($brand.Key -eq 'quilrai') { $BrandSentinel.UpgradeCode } else { $BrandQuilrAI.UpgradeCode }
+
+    # -Name override: rename the ARP product + the output filename for this build.
+    $outBase = $brand.OutputBase
+    if ($Name) {
+        $ProductName = if ($isPerEnv) { "$Name ($EnvName)" } else { $Name }
+        $outBase = ($Name -replace '[^A-Za-z0-9._-]+','-').Trim('-')
+        if (-not $outBase) { $outBase = $brand.OutputBase }
+        Write-Host "    name override: ARP='$ProductName', file base='$outBase'"
+    }
+
     # 2. Stage payload dir (per-mode so single & per-env don't collide)
     $stagedName = if ($isPerEnv) { "staged-payload-$EnvName" } else { 'staged-payload' }
     $stagedPayload = Join-Path $buildDir $stagedName
@@ -402,14 +492,32 @@ function Build-Msi {
     [IO.Compression.ZipFile]::ExtractToDirectory($pkgPath, $agentDir)
     $agentFileCount = (Get-ChildItem -LiteralPath $agentDir -Recurse -File).Count
     Write-Host "    extracted $agentFileCount agent files"
-    if (-not (Test-Path -LiteralPath (Join-Path $agentDir 'quilrai.exe'))) {
-        throw "Agent package looks wrong: quilrai.exe not found at root of $agentDir"
+    if (-not (Test-Path -LiteralPath (Join-Path $agentDir $brand.ServiceExe))) {
+        throw "Agent package looks wrong: $($brand.ServiceExe) not found at root of $agentDir"
     }
+
+    # brand.json -- read by the launcher exes at runtime to pick the brand's
+    # paths/service/process names (one set of launchers serves both brands).
+    $brandJson = [ordered]@{
+        ServiceExe     = $brand.ServiceExe
+        ServiceName    = $brand.ServiceName
+        ServiceDisplay = $brand.ServiceDisplay
+        InstallDir     = $brand.InstallDir
+        DataDir        = $brand.DataDir
+        HooksDirName   = $brand.HooksDirName
+        EnvPrefix      = $brand.EnvPrefix
+        PackagePrefix  = $brand.PackagePrefix
+        UpdaterTask    = $brand.UpdaterTask
+        Processes      = $brand.Processes
+    } | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath (Join-Path $stagedPayload 'brand.json') -Value $brandJson -Encoding UTF8
+    Write-Host "    wrote brand.json ($($brand.Key))"
 
     # The MSI ships NO PowerShell at all: install-launcher.exe and
     # uninstall-launcher.exe perform install and teardown natively.
     Copy-Item -LiteralPath $installLauncherExe    -Destination (Join-Path $stagedPayload 'install-launcher.exe')              -Force
     Copy-Item -LiteralPath $uninstallLauncherExe  -Destination (Join-Path $stagedPayload 'uninstall-launcher.exe')            -Force
+    Copy-Item -LiteralPath $updateLauncherExe     -Destination (Join-Path $stagedPayload 'update-launcher.exe')               -Force
     Copy-Item -LiteralPath $certsBundlePath       -Destination (Join-Path $stagedPayload 'certs-bundle.zip')                  -Force
     Copy-Item -LiteralPath $vcRedistPath          -Destination (Join-Path $stagedPayload 'vc_redist.x64.exe')                 -Force
 
@@ -439,16 +547,32 @@ Copyright (c) Quilr, Inc. All rights reserved.\par
     }
 
     # 3. heat-harvest the extracted agent tree -> AgentFiles-<tag>.wxs.
-    #    Files install DIRECTLY to C:\Program Files\QuilrAI (QUILRAIDIR) so MSI
-    #    owns their removal. quilrai.exe is excluded via the XSLT transform and
+    #    Files install DIRECTLY to the brand install dir (QUILRAIDIR ref) so MSI
+    #    owns their removal. The service exe is excluded via the XSLT transform and
     #    authored by hand in Product.wxs (it carries the ServiceInstall).
     #    -ag  auto-generate component GUIDs at compile (fine under MajorUpgrade)
-    #    -srd suppress harvesting the root dir element (we author QUILRAIDIR)
+    #    -srd suppress harvesting the root dir element (we author the dir)
     #    -sreg/-scom suppress registry+COM harvesting (binaries only)
     #    -sfrag emit a single fragment; -var var.AgentDir => Source="$(var.AgentDir)\.."
-    #    -t   XSLT that drops the quilrai.exe component + its ComponentRef
+    #    -t   XSLT that drops the service-exe component + its ComponentRef
     $agentWxs = Join-Path $buildDir "AgentFiles-$tag.wxs"
-    $excludeXslt = Join-Path $buildDir 'exclude-quilrai-exe.xslt'
+    # Generate the exclusion XSLT for THIS brand's service exe ("\<exe>" matches
+    # only the exact exe, not e.g. sentinel-proxy.exe).
+    $excludeXslt = Join-Path $buildDir "exclude-service-exe-$($brand.Key).xslt"
+    $xsltText = @"
+<?xml version="1.0" encoding="utf-8"?>
+<xsl:stylesheet version="1.0"
+    xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+    xmlns:wix="http://schemas.microsoft.com/wix/2006/wi"
+    exclude-result-prefixes="wix">
+  <xsl:output method="xml" indent="yes" omit-xml-declaration="no"/>
+  <xsl:template match="@*|node()"><xsl:copy><xsl:apply-templates select="@*|node()"/></xsl:copy></xsl:template>
+  <xsl:key name="svcExe" match="wix:Component[wix:File[contains(@Source, '\$($brand.ServiceExe)')]]" use="@Id"/>
+  <xsl:template match="wix:Component[key('svcExe', @Id)]"/>
+  <xsl:template match="wix:ComponentRef[key('svcExe', @Id)]"/>
+</xsl:stylesheet>
+"@
+    Set-Content -LiteralPath $excludeXslt -Value $xsltText -Encoding UTF8
     $heatArgs = @(
         'dir', $agentDir,
         '-nologo', '-ag', '-srd', '-sreg', '-scom', '-sfrag',
@@ -471,7 +595,13 @@ Copyright (c) Quilr, Inc. All rights reserved.\par
         "-dProductName=$ProductName",
         "-dUpgradeCode=$UpgradeCode",
         "-dPayloadDir=$stagedPayload",
-        "-dAgentDir=$agentDir"
+        "-dAgentDir=$agentDir",
+        "-dServiceExe=$($brand.ServiceExe)",
+        "-dServiceName=$($brand.ServiceName)",
+        "-dServiceDisplay=$($brand.ServiceDisplay)",
+        "-dServiceDescription=$($brand.ServiceDescription)",
+        "-dInstallDirName=$($brand.InstallDirName)",
+        "-dCrossUpgradeCode=$crossUpgradeCode"
     )
     if ($isPerEnv) { $candleArgs += "-dDefaultEnv=$EnvName" }
     & $candle @candleArgs '-arch' 'x64' '-ext' 'WixUIExtension' '-out' $productWixobj $wxs 2>&1 | ForEach-Object { Write-Host $_ }
@@ -485,10 +615,14 @@ Copyright (c) Quilr, Inc. All rights reserved.\par
     #    light fail at LayoutMedia with "Access denied". Building to temp + move
     #    sidesteps that; if the canonical name is still locked at move time, we
     #    keep a timestamped name so the operator always gets a usable artifact.
-    $msiName = if ($isPerEnv) { "quilrai-endpoint-agent-$EnvName-$resolvedVersion.msi" } else { 'quilrai-endpoint-agent.msi' }
+    $msiName = if ($isPerEnv) { "$outBase-$EnvName-$resolvedVersion.msi" } else { "$outBase.msi" }
     $msiOut  = Join-Path $outDir $msiName
     $msiTmp  = Join-Path $outDir ("~build-$tag-{0}.msi" -f ([guid]::NewGuid().ToString('N')))
-    $lightArgs = @('-nologo','-spdb','-ext','WixUIExtension','-cultures:en-us','-out',$msiTmp,$productWixobj,$agentWixobj)
+    # -sice:ICE03 -- the install CA's command line (all the [PROP] tokens) exceeds
+    # the CustomAction.Target column's advisory 255-char width. Windows Installer
+    # handles long Targets fine at runtime; the ICE03 "String overflow" warning is
+    # a false positive for command-line columns, so we suppress it.
+    $lightArgs = @('-nologo','-spdb','-sice:ICE03','-ext','WixUIExtension','-cultures:en-us','-out',$msiTmp,$productWixobj,$agentWixobj)
     & $light @lightArgs 2>&1 | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) { throw "light.exe failed ($tag, exit $LASTEXITCODE)" }
 

@@ -11,6 +11,8 @@
 /build/*.wixobj
 /build/*.wixpdb
 /build/AgentFiles-*.wxs
+/build/exclude-service-exe-*.xslt
+/build/staged-payload/brand.json
 #   NOTE: build/Product.wxs and build/exclude-quilrai-exe.xslt ARE tracked.
 
 # ── Bundled agent package (downloaded from the signed release, not source) ─
